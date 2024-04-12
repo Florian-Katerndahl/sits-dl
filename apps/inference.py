@@ -262,7 +262,6 @@ def main() -> int:
                 output_torch[row : row + tdc.row_step, col : col + tdc.column_step] = predict_sbert(
                     inference_model, chunk, mask, tdc.column_step, tdc.row_step, cli_args.get("batch-size"), device
                 )
-                break
 
             del chunk
 
