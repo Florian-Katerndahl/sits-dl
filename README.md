@@ -4,9 +4,9 @@ This Python package combines different deep learning models, namely one LSTM and
 
 ## Installation
 
-This packages uses Poetry for dependency management, isolation and packaging. Depending on how you want to install/work with `sits_dl`, you may need to install (Poetry)[https://python-poetry.org/] priot.
+This packages uses Poetry for dependency management, isolation and packaging. Depending on how you want to install/work with `sits_dl`, you may need to install [Poetry](https://python-poetry.org/) priot.
 
-To install the package for testing/prototyping purposes, simply clone this repo and run `poetry install`. Note that by default, the CUDA 12 wheels of Pytorch are installed. If you want to use other versions, refer to the (Poetry documentation)[https://python-poetry.org/docs/cli#source] on how to change package sources.
+To install the package for testing/prototyping purposes, simply clone this repo and run `poetry install`. Note that by default, the CUDA 12 wheels of Pytorch are installed. If you want to use other versions, refer to the [Poetry documentation](https://python-poetry.org/docs/cli#source) on how to change package sources.
 
 ## Applications Distributed with This Package
 
