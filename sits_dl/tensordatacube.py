@@ -128,7 +128,6 @@ class TensorDataCube:
     def __str__(self) -> str:
         pass
 
-    # @torch.inference_mode()
     def empty_output(self, dtype: torch.dtype=torch.long) -> torch.Tensor:
         return torch.full(
             [self.image_info["tile_height"], self.image_info["tile_width"]],
