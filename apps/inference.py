@@ -253,7 +253,6 @@ def main() -> int:
                     inference_model, chunk, mask, tdc.column_step, tdc.row_step, cli_args.get("batch-size"), device
                 )
             else:
-                # TODO what my SBERT infernce cannot do right now, is specifying a start date and forcing the time series to be only four years long
                 #  However, the last point is adressed by the cutoff date combined with the squence length. Right? So only a start date must be implemented on my side
                 # this trades memory consumption for ease of use
                 # chunk[:,:,:,-2] and chunk[:,:,:,-1] each contain the exact same value in (x, y, d)
