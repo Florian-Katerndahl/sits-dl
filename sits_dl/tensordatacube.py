@@ -98,6 +98,10 @@ class TensorDataCube:
                     ds.close()
                     del clipped_ds
 
+                # TODO also for Jonathan's transformer model?
+                if self.inference_type == Models.SBERT:
+                    s2_cube_np = np.where(s2_cube_np == -9999, np.nan, s2_cube_np)
+
                 if self.inference_type == Models.TRANSFORMER or self.inference_type == Models.SBERT:
                     _t: Tuple[List[Union[datetime, float]], List[bool]] = TensorDataCube.pad_doy_sequence(
                         self.sequence_length, [TensorDataCube.fp_to_doy(it) for it in self.cube_inputs]
