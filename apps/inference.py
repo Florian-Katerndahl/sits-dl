@@ -66,8 +66,17 @@ def main() -> int:
         help="Path to directory into which predictions should be saved. By default, use the " "current PWD.",
     )
     parser.add_argument(
+        "--date-start",
+        dest="date_begin",
+        required=False,
+        type=int,
+        default=None,
+        help="Begin date for time series which should be included in datacue for inference. "
+        "If not specified, take all images up to `date-cutoff`."
+    )
+    parser.add_argument(
         "--date-cutoff",
-        dest="date",
+        dest="date_end",
         required=True,
         type=int,
         help="Cutoff date for time series which should be included in datacube for inference.",
@@ -209,7 +218,8 @@ def main() -> int:
             cli_args.get("base"),
             tile,
             cli_args.get("iglob"),
-            cli_args.get("date"),
+            cli_args.get("date_begin"),
+            cli_args.get("date_end"),
             inference_type,
             cli_args.get("row-block"),
             cli_args.get("col-block"),

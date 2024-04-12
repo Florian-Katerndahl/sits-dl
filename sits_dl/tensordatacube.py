@@ -33,6 +33,7 @@ class TensorDataCube:
         input_directory: Path,
         tile_id: str,
         input_glob: str,
+        start: Optional[int],
         cutoff: int,
         inference_type: Models,
         row_step: Optional[int] = None,
@@ -42,6 +43,7 @@ class TensorDataCube:
         self.input_directory: Path = input_directory
         self.tile_id: str = tile_id
         self.input_glob: str = input_glob
+        self.start: Optional[int] = start
         self.cutoff: int = cutoff
         self.inference_type: Models = inference_type
         self.row_step: Optional[int] = row_step
@@ -51,10 +53,13 @@ class TensorDataCube:
         self.cube_inputs: Optional[List[str]] = None
         self.image_info: Optional[Dict] = None
         self.output_metadata: Optional[Dict] = None
-        # self.output: Optional[torch.tensor] = None
 
     def self_prep(self) -> None:
         tile_paths: List[str] = [str(p) for p in (self.input_directory / self.tile_id).glob(self.input_glob)]
+        if self.start:
+            self.cube_inputs = [
+                tile_path for tile_path in tile_paths if int(search(r"\d{8}", tile_path).group(0)) >= self.start
+            ]
         self.cube_inputs = [
             tile_path for tile_path in tile_paths if int(search(r"\d{8}", tile_path).group(0)) <= self.cutoff
         ]
