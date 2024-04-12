@@ -1,0 +1,6 @@
+__pycache__/
+
+poetry.lock
+tiles.txt
+*.tar
+*.tif

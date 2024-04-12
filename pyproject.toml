@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "sits-dl"
+version = "0.1.0"
+description = ""
+authors = ["Florian Katerndahl <florian@katerndahl.com>"]
+readme = "README.md"
+packages = [
+    { include = "sits_dl" }
+]
+
+
+[tool.poetry.scripts]
+inference = "apps.inference:main"
+
+
+[tool.poetry.dependencies]
+python = "^3.9"
+numpy = "^1.26.4"
+rasterio = "^1.3.9"
+torch = "^2.2.2"
+torchvision = "^0.17.2"
+rioxarray = "^0.15.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
