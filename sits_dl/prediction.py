@@ -69,7 +69,21 @@ def predict_sbert(sbert: SBERTClassification, dc: torch.Tensor, mask: Optional[n
     prediction: torch.Tensor = torch.full((r_step * c_step,), fill_value=TDC.OUTPUT_NODATA, dtype=torch.float)
 
     if mask is not None:
-        raise NotImplementedError
+        mask_long: torch.Tensor = torch.from_numpy(np.reshape(mask, (-1,))).bool()
+        for batch_index, batch in enumerate(dl):
+            for _, samples in enumerate(batch):
+                start: int = batch_index * batch_size
+                end: int = start + len(samples)
+                subset: torch.Tensor = mask_long[start:end]
+                if not torch.any(subset):
+                    next
+                input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)  # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
+                res = torch.sigmoid(
+                    sbert(x=input_tensor[:,:,:-2],
+                          doy=input_tensor[:,:,-2].long(),
+                          mask=input_tensor[:,:,-1].long())
+                          ).cpu().squeeze()
+                prediction[start:end][subset] = res
     else:
         for batch_index, batch in enumerate(dl):
             for _, samples in enumerate(batch):

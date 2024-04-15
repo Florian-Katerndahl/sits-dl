@@ -208,6 +208,10 @@ def main() -> int:
         if cli_args.get("mgpu"):
             inference_model = DataParallel(inference_model)
 
+    if inference_model == Models.SBERT or inference_model == Models.TRANSFORMER and not cli_args.get("sequence"):
+        raise RuntimeError("Provided a transformer model without providing the sequence length."
+                           "Please re-run with `--sequence` set.")
+
     with open(cli_args.get("input"), "rt") as f:
         force_tiles: List[str] = [tile.replace("\n", "") for tile in f.readlines()]
 
@@ -253,8 +257,7 @@ def main() -> int:
                     inference_model, chunk, mask, tdc.column_step, tdc.row_step, cli_args.get("batch-size"), device
                 )
             else:
-                #  However, the last point is adressed by the cutoff date combined with the squence length. Right? So only a start date must be implemented on my side
-                # this trades memory consumption for ease of use
+                # this trades memory consumption for ease of use/generality
                 # chunk[:,:,:,-2] and chunk[:,:,:,-1] each contain the exact same value in (x, y, d)
                 tto = torch.tensor(true_obs).repeat_interleave(tdc.row_step * tdc.column_step).reshape((tdc.row_step, tdc.column_step, cli_args.get("sequence"), 1))
                 chunk = torch.cat([chunk, tto], dim=3)
