@@ -2,11 +2,19 @@
 name = "sits-dl"
 version = "0.1.0"
 description = ""
-authors = ["Florian Katerndahl <florian@katerndahl.com>"]
-readme = "README.md"
-packages = [
-    { include = "sits_dl" }
+authors = [
+    "Florian Katerndahl <florian@katerndahl.com>",
+    "Christopher Schiller <christopher.schiller@fu-berlin.de>",
+    "Jonathan Költzow <jonathan.koeltzow@fu-berlin.de>"
 ]
+maintainers = [
+    "Florian Katerndahl <florian@katerndahl.com>"
+]  
+readme = "README.md"
+repository = "https://github.com/Florian-Katerndahl/sits-dl"
+#packages = [
+#    { include = "sits_dl" }
+#]
 
 
 [tool.poetry.scripts]
