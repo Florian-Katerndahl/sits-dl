@@ -307,7 +307,6 @@ class SBERTClassification(nn.Module):
                             mask=samples[:,:,-1].long())
                             ).cpu().squeeze()
                     prediction[start:end] = res
-                    print(f"Predicted batch N°{batch_index}")
 
         return torch.reshape(prediction, (r_step, c_step))
 
