@@ -193,8 +193,10 @@ def main() -> int:
         ).eval()
         if "lstm" in inference_model.__module__.lower():
             inference_type = Models.LSTM
+            inference_model.predict = lstm.LSTMClassifier.predict
         elif "transformer" in inference_model.__module__.lower():
             inference_type = Models.TRANSFORMER
+            inference_model.predict = transformer.TransformerClassifier.predict
         else:
             raise RuntimeError("Unknown model type supplied")
     except AttributeError:
@@ -238,14 +240,16 @@ def main() -> int:
         for chunk, true_obs, row, col in tdc:
             r_start, r_end, c_start, c_end = row, row + tdc.row_step, col, col + tdc.column_step
             mask: Optional[np.ndarray] = None
-            mask_dir: Path
-            mask_path: str
 
             if cli_args.get("masks"):
-                if (mask_dir := cli_args.get("masks") / tile).exists():
-                    mask_path = str(mask_dir.glob(cli_args.get("mglob")))
-                else:
-                    mask_path = str(cli_args.get("masks").glob(cli_args.get("mglob")))
+                mask_dir: Path = cli_args.get("masks") / tile
+                if not mask_dir.exists():
+                    mask_dir = mask_dir.parent
+
+                try:
+                    mask_path: str = str(list(mask_dir.glob(cli_args.get("mglob"))).pop())
+                except IndexError:
+                    raise RuntimeError("Provided mask directory and name but could not find any files")
 
                 with rxr.open_rasterio(mask_path) as ds:
                     mask_ds: xarray.Dataset = ds.isel(
