@@ -1,8 +1,11 @@
 """
-LSTM implementation from https://github.com/JKfuberlin/SITST4TSC
+LSTM implementation adapted from https://github.com/JKfuberlin/SITST4TSC
 """
 import torch
 from torch import nn, Tensor
+from typing import Optional
+import numpy as np
+from sits_dl.tensordatacube import TensorDataCube as TDC
 
 # Device configuration
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -41,6 +44,33 @@ class LSTMClassifier(nn.Module):
         lstm_out, _ = self.lstm(x, (h0, c0))
         out = self.fc(lstm_out[:, -1, :])
         return out
+
+    
+    @torch.inference_mode()
+    def predict(self, dc: torch.Tensor, mask: Optional[np.ndarray], c_step: int, r_step: int, *args, **kwargs) -> torch.Tensor:
+        raise RuntimeError("The datacube is currently not adapted to this model")
+    
+        prediction: torch.Tensor = torch.full((r_step * c_step,), fill_value=TDC.OUTPUT_NODATA, dtype=torch.long)
+        if mask:
+            merged_row: torch.Tensor = torch.full(c_step, fill_value=TDC.OUTPUT_NODATA, dtype=torch.long)
+            for chunk_rows in range(0, r_step):
+                merged_row.zero_()
+                squeezed_row: torch.Tensor
+                _, squeezed_row = torch.max(
+                    self.forward(dc[chunk_rows, mask[chunk_rows]]).data,
+                    dim=1
+                )
+                
+                merged_row[mask[chunk_rows]] = squeezed_row
+                prediction[chunk_rows, 0:c_step] = merged_row
+        else:
+            for chunk_rows in range(0, r_step):
+                _, prediction[chunk_rows, 0:c_step] = torch.max(
+                    self.forward(dc[chunk_rows]).data,
+                    dim=1
+                )
+        
+        return prediction
 
 
 class LSTMCPU(nn.Module):

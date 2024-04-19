@@ -112,10 +112,9 @@ class TensorDataCube:
                     sensing_doys_np = np.repeat(sensing_doys_np, self.row_step, axis=2)  # match actual data cube
                     sensing_doys_np = np.repeat(sensing_doys_np, self.column_step, axis=3)  # match actual data cube
                     s2_cube_np = TensorDataCube.pad_datacube(self.sequence_length, s2_cube_np)
+                    assert s2_cube_np[true_observations].shape[0] == sum(true_observations)  # TODO remove assertion
+                    s2_cube_np[true_observations] = (s2_cube_np[true_observations] - np.nanmean(s2_cube_np[true_observations], axis=0)) / (np.nanstd(s2_cube_np[true_observations], axis=0) + 1e-6)  # normalize across bands, dont touch DOYs
                     s2_cube_np = np.concatenate((s2_cube_np, sensing_doys_np), axis=1)
-
-                if self.inference_type == Models.TRANSFORMER or self.inference_type == Models.SBERT:
-                    s2_cube_np = (s2_cube_np - s2_cube_np.mean(axis=0)) / (s2_cube_np.std(axis=0) + 1e-6)
 
                 s2_cube_npt: np.ndarray = np.transpose(s2_cube_np, (2, 3, 0, 1))
                 s2_cube_torch: Union[torch.Tensor, torch.masked.masked_tensor] = torch.from_numpy(s2_cube_npt).float()
@@ -139,6 +138,15 @@ class TensorDataCube:
             dtype=dtype,
         )
     
+
+    @classmethod
+    def to_dataloader(cls, chunk: torch.Tensor, batch_size: int) -> DataLoader:
+        rows, _ = chunk.shape[:2]
+        split_dc = [torch.squeeze(i, dim=0) for i in torch.vsplit(chunk, rows)]
+        # slightly slower approach but easier to capture output
+        ds: TensorDataset = TensorDataset(torch.cat(split_dc, 0))  # TensorDataset splits along first dimension of input
+        return DataLoader(ds, batch_size=batch_size, pin_memory=True, num_workers=4, persistent_workers=True)
+
 
     @classmethod
     def pad_doy_sequence(cls, target: int, observations: List[datetime]) -> Tuple[List[Union[datetime, float]], List[bool]]:
@@ -177,11 +185,3 @@ class TensorDataCube:
         # https://docs.python.org/3/library/datetime.html#datetime.datetime.timetuple
         doy: int = d.toordinal() - date(d.year, 1, 1).toordinal() + 1
         return doy
-
-
-def dataloader_from_chunk(chunk: torch.Tensor, batch_size: int) -> DataLoader:
-    rows, _ = chunk.shape[:2]
-    split_dc = [torch.squeeze(i, dim=0) for i in torch.vsplit(chunk, rows)]
-    # slightly slower approach but easier to capture output
-    ds: TensorDataset = TensorDataset(torch.cat(split_dc, 0))  # TensorDataset splits along first dimension of input
-    return DataLoader(ds, batch_size=batch_size, pin_memory=True, num_workers=4, persistent_workers=True)

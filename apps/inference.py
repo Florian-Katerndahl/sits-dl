@@ -171,6 +171,8 @@ def main() -> int:
 
     cli_args: Dict[str, Union[Path, int, bool, str]] = vars(parser.parse_args())
 
+    # TODO look into how the logging module really works and insert logging statements in other parts of
+    #      the lib?
     if cli_args.get("log"):
         if cli_args.get("log-file"):
             logging.basicConfig(level=logging.INFO, filename=cli_args.get("log-file"))
@@ -184,14 +186,16 @@ def main() -> int:
     device: str = torch.device(cli_args.get("gpu") if torch.cuda.is_available() else "cpu")
 
     # FIXME this is somewhat ugly
+    inference_model: Union[lstm.LSTMClassifier, transformer.TransformerClassifier, SBERTClassification]
+    inference_type: Models
     try:
-        inference_model: Union[lstm.LSTMClassifier, transformer.TransformerClassifier, SBERTClassification] = torch.load(
+        inference_model = torch.load(
         cli_args.get("weights"), map_location=device
         ).eval()
         if "lstm" in inference_model.__module__.lower():
-            inference_type: Models = Models.LSTM
+            inference_type = Models.LSTM
         elif "transformer" in inference_model.__module__.lower():
-            inference_type: Models = Models.TRANSFORMER
+            inference_type = Models.TRANSFORMER
         else:
             raise RuntimeError("Unknown model type supplied")
     except AttributeError:
@@ -199,8 +203,8 @@ def main() -> int:
         SBERTClassArgs: Dict = {'num_classes': 1, 'seq_len': cli_args.get("sequence")}
         
         checkpoint = torch.load(cli_args.get("weights"), map_location=device)
-        inference_type: Models = Models.SBERT
-        inference_model: Union[lstm.LSTMClassifier, transformer.TransformerClassifier, SBERTClassification] = SBERTClassification(SBERT(**SBERTArgs), **SBERTClassArgs)
+        inference_type = Models.SBERT
+        inference_model = SBERTClassification(SBERT(**SBERTArgs), **SBERTClassArgs)
         inference_model.load_state_dict(checkpoint["model_state_dict"])
         inference_model.to(device)
         inference_model.eval()
@@ -208,7 +212,7 @@ def main() -> int:
         if cli_args.get("mgpu"):
             inference_model = DataParallel(inference_model)
 
-    if inference_model == Models.SBERT or inference_model == Models.TRANSFORMER and not cli_args.get("sequence"):
+    if (inference_type == Models.SBERT or inference_type == Models.TRANSFORMER) and not cli_args.get("sequence"):
         raise RuntimeError("Provided a transformer model without providing the sequence length."
                            "Please re-run with `--sequence` set.")
 
@@ -233,37 +237,38 @@ def main() -> int:
         output_torch: torch.Tensor = tdc.empty_output(torch.float if inference_type == Models.SBERT else torch.long)
 
         for chunk, true_obs, row, col in tdc:
+            r_start, r_end, c_start, c_end = row, row + tdc.row_step, col, col + tdc.column_step
             mask: Optional[np.ndarray] = None
+            mask_dir: Path
+            mask_path: str
 
             if cli_args.get("masks"):
-                try:
-                    mask_path: str = [str(p) for p in (cli_args.get("masks") / tile).glob(cli_args.get("mglob"))][0]
-                except IndexError:
-                    mask_path: str = [str(p) for p in cli_args.get("masks").glob(cli_args.get("mglob"))][0]
+                if (mask_dir := cli_args.get("masks") / tile).exists():
+                    mask_path = str(mask_dir.glob(cli_args.get("mglob")))
+                else:
+                    mask_path = str(cli_args.get("masks").glob(cli_args.get("mglob")))
 
                 with rxr.open_rasterio(mask_path) as ds:
                     mask_ds: xarray.Dataset = ds.isel(
                         y=slice(row, row + tdc.row_step), x=slice(col, col + tdc.column_step)
                     )
-                    mask: np.ndarray = np.squeeze(np.array(mask_ds, ndmin=2, dtype=np.bool_), axis=0)
+                    mask = np.squeeze(np.array(mask_ds, ndmin=2, dtype=np.bool_), axis=0)
                     del mask_ds
 
-            if inference_type == Models.LSTM:
-                output_torch[row : row + tdc.row_step, col : col + tdc.column_step] = predict_lstm(
-                    inference_model, chunk, mask, tdc.column_step, tdc.row_step
-                )
-            elif inference_type == Models.TRANSFORMER:
-                output_torch[row : row + tdc.row_step, col : col + tdc.column_step] = predict_transformer(
-                    inference_model, chunk, mask, tdc.column_step, tdc.row_step, cli_args.get("batch-size"), device
-                )
-            else:
+            if inference_type == Models.SBERT:
                 # this trades memory consumption for ease of use/generality
                 # chunk[:,:,:,-2] and chunk[:,:,:,-1] each contain the exact same value in (x, y, d)
                 tto = torch.tensor(true_obs).repeat_interleave(tdc.row_step * tdc.column_step).reshape((tdc.row_step, tdc.column_step, cli_args.get("sequence"), 1))
                 chunk = torch.cat([chunk, tto], dim=3)
-                output_torch[row : row + tdc.row_step, col : col + tdc.column_step] = predict_sbert(
-                    inference_model, chunk, mask, tdc.column_step, tdc.row_step, cli_args.get("batch-size"), device
-                )
+
+            output_torch[r_start:r_end, c_start:c_end] = inference_model.predict(
+                chunk,
+                mask,
+                tdc.column_step,
+                tdc.row_step,
+                cli_args.get("batch-size"),
+                device
+            )
 
             del chunk
 
