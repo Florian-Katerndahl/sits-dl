@@ -13,7 +13,6 @@ import xarray
 import logging
 from time import time
 from sits_dl.tensordatacube import TensorDataCube, Models
-from sits_dl.prediction import predict_lstm, predict_transformer, predict_sbert
 from sits_dl.sbert import SBERT, SBERTClassification
 from sits_dl import lstm
 from sits_dl import transformer
