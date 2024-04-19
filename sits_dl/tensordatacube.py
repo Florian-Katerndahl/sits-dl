@@ -140,9 +140,9 @@ class TensorDataCube:
     
 
     @classmethod
-    def to_dataloader(cls, chunk: torch.Tensor, batch_size: int) -> DataLoader:
+    def to_dataloader(cls, chunk: torch.Tensor, batch_size: int, workers: int = 4) -> DataLoader:
         ds: TensorDataset = TensorDataset(torch.reshape(chunk, (-1, chunk.shape[2], chunk.shape[3])))  # TensorDataset splits along first dimension of input
-        return DataLoader(ds, batch_size=batch_size, pin_memory=True, num_workers=4, persistent_workers=True)
+        return DataLoader(ds, batch_size=batch_size, pin_memory=True, num_workers=workers, persistent_workers=True)
 
 
     @classmethod
