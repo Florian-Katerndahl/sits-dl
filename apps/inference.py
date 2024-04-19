@@ -193,10 +193,10 @@ def main() -> int:
         ).eval()
         if "lstm" in inference_model.__module__.lower():
             inference_type = Models.LSTM
-            inference_model.predict = lstm.LSTMClassifier.predict
+            inference_model.predict = lstm.LSTMClassifier.predict.__get__(inference_model)  # https://stackoverflow.com/a/2982; https://stackoverflow.com/a/73581487
         elif "transformer" in inference_model.__module__.lower():
             inference_type = Models.TRANSFORMER
-            inference_model.predict = transformer.TransformerClassifier.predict
+            inference_model.predict = transformer.TransformerClassifier.predict.__get__(inference_model)  # https://stackoverflow.com/a/2982; https://stackoverflow.com/a/73581487
         else:
             raise RuntimeError("Unknown model type supplied")
     except AttributeError:

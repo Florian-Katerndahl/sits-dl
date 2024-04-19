@@ -133,18 +133,20 @@ class TransformerClassifier(nn.Module):
                     if not torch.any(subset):
                         next
                     input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)  # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
-                    _, prediction[start:end][subset] = torch.max(
+                    _, data = torch.max(
                         self.forward(input_tensor),
                         dim=1
-                    ).cpu()
+                    )
+                    prediction[start:end][subset] = data.cpu()
         else:
             for batch_index, batch in enumerate(dl):
                 for _, samples in enumerate(batch):
                     start: int = batch_index * batch_size
                     end: int = start + len(samples)
-                    _, prediction[start:end] = torch.max(
+                    _, data = torch.max(
                         self.forward(samples.to(device, non_blocking=True)),
                         dim=1
-                    ).cpu()
+                    )
+                    prediction[start:end] = data.cpu()
 
         return torch.reshape(prediction, (r_step, c_step))
