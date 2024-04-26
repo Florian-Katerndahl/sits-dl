@@ -258,12 +258,6 @@ def main() -> int:
                     mask = np.squeeze(np.array(mask_ds, ndmin=2, dtype=np.bool_), axis=0)
                     del mask_ds
 
-            if inference_type == Models.SBERT:
-                # this trades memory consumption for ease of use/generality
-                # chunk[:,:,:,-2] and chunk[:,:,:,-1] each contain the exact same value in (x, y, d)
-                tto = torch.tensor(true_obs).repeat_interleave(tdc.row_step * tdc.column_step).reshape((tdc.row_step, tdc.column_step, cli_args.get("sequence"), 1))
-                chunk = torch.cat([chunk, tto], dim=3)
-
             output_torch[r_start:r_end, c_start:c_end] = inference_model.predict(
                 chunk,
                 mask,

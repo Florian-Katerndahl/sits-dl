@@ -27,6 +27,7 @@ class TensorDataCube:
     """
 
     OUTPUT_NODATA: int = 255
+    DATE_IN_FPATH: Pattern = compile(r"(?<=/)\d{8}(?=_)")
 
     def __init__(
         self,
@@ -58,11 +59,14 @@ class TensorDataCube:
         tile_paths: List[str] = [str(p) for p in (self.input_directory / self.tile_id).glob(self.input_glob)]
         if self.start:
             self.cube_inputs = [
-                tile_path for tile_path in tile_paths if int(search(r"\d{8}", tile_path).group(0)) >= self.start
+                tile_path for tile_path in tile_paths \
+                    if self.start <= int(search(r"\d{8}", tile_path).group(0)) <= self.cutoff
             ]
-        self.cube_inputs = [
-            tile_path for tile_path in tile_paths if int(search(r"\d{8}", tile_path).group(0)) <= self.cutoff
-        ]
+        else:
+            self.cube_inputs = [
+                tile_path for tile_path in tile_paths \
+                    if int(search(r"\d{8}", tile_path).group(0)) <= self.cutoff
+            ]
         self.cube_inputs.sort()
 
         with rasterio.open(self.cube_inputs[0]) as f:
@@ -98,10 +102,7 @@ class TensorDataCube:
                     ds.close()
                     del clipped_ds
 
-                if self.inference_type == Models.SBERT:
-                    s2_cube_np = np.where(s2_cube_np == -9999, np.nan, s2_cube_np)
-
-                if self.inference_type == Models.TRANSFORMER or self.inference_type == Models.SBERT:
+                if self.inference_type == Models.TRANSFORMER:
                     _t: Tuple[List[Union[datetime, float]], List[bool]] = TensorDataCube.pad_doy_sequence(
                         self.sequence_length,
                         self.cube_inputs,
@@ -112,13 +113,52 @@ class TensorDataCube:
                     sensing_doys_np = sensing_doys_np.reshape((self.sequence_length, 1, 1, 1))
                     sensing_doys_np = np.repeat(sensing_doys_np, self.row_step, axis=2)  # match actual data cube
                     sensing_doys_np = np.repeat(sensing_doys_np, self.column_step, axis=3)  # match actual data cube
+                elif self.inference_type == Models.SBERT:
+                    # Goal: move all valid observations to the "front" of the data cube (i.e. lower indices)
+                    # This is a "batch" operation of what Chris does sequentially
+                    s2_cube_np = np.where(s2_cube_np == -9999, np.nan, s2_cube_np)
+                    s2_cube_np = np.reshape(s2_cube_np, (-1, *s2_cube_np.shape[:2]))
+                    pixels, observations, bands = s2_cube_np.shape
+                    observations_without_nodata: np.ndarray = ~np.isnan(s2_cube_np).any(axis=2)
+                    s2_cube_np[~observations_without_nodata] = np.nan
+                    index_array = np.arange(observations).reshape((1, observations, 1)).repeat(pixels, axis=0)
+                    index_array[observations_without_nodata] -= observations * 2
+                    # sorting_keys is now an array where for each pixel, the indices are sorted such that all non-nan observations are followed by all nan observations.
+                    # Within the respective groups, ordering is kept by observation date
+                    sorting_keys = index_array.argsort(axis=1)
+                    s2_cube_np = np.take_along_axis(s2_cube_np, sorting_keys, axis=1)  # actually move data
+
+                    true_observations = ~np.isnan(s2_cube_np).any(axis=2).reshape((pixels, observations, 1))  # SBERT mask
+                    sensing_dates_as_ordinal = [TensorDataCube.ordinal_observation(i) for i in self.cube_inputs]
+                    sensing_doys_np = np.array(sensing_dates_as_ordinal).reshape((1, observations, 1)).repeat(pixels, axis=0)
+                    sensing_doys_np = np.take_along_axis(sensing_doys_np, sorting_keys, axis=1)
+                    doy_of_earliest_observations = TensorDataCube.toyday(sensing_doys_np[:, 0, 0]).reshape((pixels, 1)).repeat(observations, axis=1)
+                    sensing_doys_np = (sensing_doys_np[:,:,0] - sensing_doys_np[:, 0].repeat(58, axis=1) + doy_of_earliest_observations).reshape((pixels, observations, 1))
+                    sensing_doys_np[~true_observations] = 0
+                    true_observations = true_observations.reshape((pixels, observations, 1)).astype(int)
+                    
+                    # at this point in time it's still possible for doys and true_observations to contain more or less observations than sequence length permits
+                    s2_cube_np = np.reshape(s2_cube_np, (len(self.cube_inputs), self.image_info["input_bands"], self.row_step, self.column_step))
+                    true_observations = np.reshape(true_observations, (len(self.cube_inputs), 1, self.row_step, self.column_step))
+                    sensing_doys_np = np.reshape(sensing_doys_np, (len(self.cube_inputs), 1, self.row_step, self.column_step))
+
+                    true_observations = TensorDataCube.pad_datacube(self.sequence_length, true_observations, 0)
+                    sensing_doys_np = TensorDataCube.pad_datacube(self.sequence_length, sensing_doys_np, 0)
+
+                if self.inference_type in [Models.TRANSFORMER, Models.SBERT]:
+                    # assumes s2_cube_np is padded with np.nan
                     s2_cube_np = TensorDataCube.pad_datacube(self.sequence_length, s2_cube_np)
-                    assert s2_cube_np[true_observations].shape[0] == sum(true_observations)  # TODO remove assertion
-                    s2_cube_np[true_observations] = (s2_cube_np[true_observations] - np.nanmean(s2_cube_np[true_observations], axis=0)) / (np.nanstd(s2_cube_np[true_observations], axis=0)) + 1e-6  # normalize across bands, dont touch DOYs
+                    s2_cube_np = (s2_cube_np - np.nanmean(s2_cube_np, axis=0)) / np.nanstd(s2_cube_np, axis=0) + 1e-6  # normalize across bands, dont touch DOYs
+                    s2_cube_np = np.where(np.isnan(s2_cube_np), 0.0, s2_cube_np)
                     s2_cube_np = np.concatenate((s2_cube_np, sensing_doys_np), axis=1)
 
                 s2_cube_npt: np.ndarray = np.transpose(s2_cube_np, (2, 3, 0, 1))
                 s2_cube_torch: Union[torch.Tensor, torch.masked.masked_tensor] = torch.from_numpy(s2_cube_npt).float()
+
+                if self.inference_type == Models.SBERT:
+                    # such, that ugly transposing is not needed in main inference script
+                    true_observations = np.transpose(true_observations, (2, 3, 0, 1))
+                    s2_cube_torch = torch.cat([s2_cube_torch, torch.from_numpy(true_observations)], dim=3)
 
                 try:
                     del s2_cube_np
@@ -162,13 +202,14 @@ class TensorDataCube:
 
         return [TensorDataCube.fp_to_doy(i, observations[0] if mtype == Models.SBERT else None) for i in observations if isinstance(i, str)], true_observations
 
+
     @classmethod
-    def pad_datacube(cls, target: int, datacube: np.ndarray) -> np.ndarray:
+    def pad_datacube(cls, target: int, datacube: np.ndarray, pad_value=np.nan) -> np.ndarray:
         diff: int = target - datacube.shape[0]
         if diff < 0:
             datacube = np.delete(datacube, list(range(abs(diff))), axis=0)  # deletes oldest entries first
         elif diff > 0:
-            datacube = np.pad(datacube, ((0, diff), (0, 0), (0, 0), (0, 0)))
+            datacube = np.pad(datacube, ((0, diff), (0, 0), (0, 0), (0, 0)), constant_values=pad_value)
 
         # TODO remove assertion for "production"
         assert target == datacube.shape[0]
@@ -187,3 +228,14 @@ class TensorDataCube:
             od: datetime = datetime.strptime(origin_date, "%Y%m%d")
             return (d - od).days + od.timetuple().tm_yday
         return d.timetuple.tm_yday
+
+
+    @staticmethod
+    @np.vectorize(otypes=[int])
+    def toyday(x):
+        return datetime.fromordinal(x).timetuple().tm_yday
+    
+
+    @staticmethod
+    def ordinal_observation(x: str) -> int:
+        return datetime.strptime(TensorDataCube.DATE_IN_FPATH.findall(x)[0], "%Y%m%d").toordinal()
