@@ -98,13 +98,14 @@ class TensorDataCube:
                     ds.close()
                     del clipped_ds
 
-                # TODO also for Jonathan's transformer model?
                 if self.inference_type == Models.SBERT:
                     s2_cube_np = np.where(s2_cube_np == -9999, np.nan, s2_cube_np)
 
                 if self.inference_type == Models.TRANSFORMER or self.inference_type == Models.SBERT:
                     _t: Tuple[List[Union[datetime, float]], List[bool]] = TensorDataCube.pad_doy_sequence(
-                        self.sequence_length, [TensorDataCube.fp_to_doy(it) for it in self.cube_inputs]
+                        self.sequence_length,
+                        self.cube_inputs,
+                        self.inference_type
                     )
                     sensing_doys, true_observations = _t
                     sensing_doys_np: np.ndarray = np.array(sensing_doys)
@@ -146,7 +147,7 @@ class TensorDataCube:
 
 
     @classmethod
-    def pad_doy_sequence(cls, target: int, observations: List[datetime]) -> Tuple[List[Union[datetime, float]], List[bool]]:
+    def pad_doy_sequence(cls, target: int, observations: List[str], mtype: Models) -> Tuple[List[Union[datetime, float]], List[bool]]:
         diff: int = target - len(observations)
         true_observations: List[bool] = [True] * len(observations)
         if diff < 0:
@@ -159,7 +160,7 @@ class TensorDataCube:
         # TODO remove assertion for "production"
         assert target == len(observations)
 
-        return observations, true_observations
+        return [TensorDataCube.fp_to_doy(i, observations[0] if mtype == Models.SBERT else None) for i in observations if isinstance(i, str)], true_observations
 
     @classmethod
     def pad_datacube(cls, target: int, datacube: np.ndarray) -> np.ndarray:
@@ -175,10 +176,14 @@ class TensorDataCube:
         return datacube
 
     @classmethod
-    def fp_to_doy(cls, file_path: str) -> datetime:
+    def fp_to_doy(cls, file_path: str, origin: Optional[str] = None) -> datetime:
         date_in_fp: Pattern = compile(r"(?<=/)\d{8}(?=_)")
         sensing_date: str = date_in_fp.findall(file_path)[0]
         d: datetime = datetime.strptime(sensing_date, "%Y%m%d")
-        # https://docs.python.org/3/library/datetime.html#datetime.datetime.timetuple
-        doy: int = d.toordinal() - date(d.year, 1, 1).toordinal() + 1
-        return doy
+        # This is a bit resource wasting since origin does not change but is re-computed for each
+        # observation
+        if origin:
+            origin_date: str = date_in_fp.findall(origin)[0]
+            od: datetime = datetime.strptime(origin_date, "%Y%m%d")
+            return (d - od).days + od.timetuple().tm_yday
+        return d.timetuple.tm_yday
