@@ -114,7 +114,7 @@ class TensorDataCube:
                     sensing_doys_np = np.repeat(sensing_doys_np, self.column_step, axis=3)  # match actual data cube
                     s2_cube_np = TensorDataCube.pad_datacube(self.sequence_length, s2_cube_np)
                     assert s2_cube_np[true_observations].shape[0] == sum(true_observations)  # TODO remove assertion
-                    s2_cube_np[true_observations] = (s2_cube_np[true_observations] - np.nanmean(s2_cube_np[true_observations], axis=0)) / (np.nanstd(s2_cube_np[true_observations], axis=0) + 1e-6)  # normalize across bands, dont touch DOYs
+                    s2_cube_np[true_observations] = (s2_cube_np[true_observations] - np.nanmean(s2_cube_np[true_observations], axis=0)) / (np.nanstd(s2_cube_np[true_observations], axis=0)) + 1e-6  # normalize across bands, dont touch DOYs
                     s2_cube_np = np.concatenate((s2_cube_np, sensing_doys_np), axis=1)
 
                 s2_cube_npt: np.ndarray = np.transpose(s2_cube_np, (2, 3, 0, 1))
