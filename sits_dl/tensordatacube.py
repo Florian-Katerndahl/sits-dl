@@ -1,24 +1,49 @@
 from datetime import datetime, date
+from time import time
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Union, Tuple
 from re import search, Pattern, compile
+from warnings import warn
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 import rasterio
 import numpy as np
+from numba import njit, prange
 import rioxarray as rxr
 from xarray import Dataset, DataArray
+from sits_dl.forestmask import ForestMask
+
+# TODO https://numba.pydata.org/numba-doc/latest/user/parallel.html?highlight=prange#explicit-parallel-loops
+#   does this mean I invoke a race condition below?
+@njit(['float32[:,:,:](float32[:,:,:], Omitted(1e-6))', 'float32[:,:,:](float32[:,:,:], float32)'], parallel=True)
+def znorm_PSB(dc: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Apply z-normalization to data cube per pixel and per band.
+
+    .. note:: Only valid for a datacube with the shape (pixels, sequence, bands)
+
+    :param dc: Input data cube
+    :type dc: np.ndarray
+    :param eps: Epsilon to add for numeric stability, defaults to 1e-6
+    :type eps: float, optional
+    :return: Datacube normalized for each pixel and band across sequence length.
+    :rtype: np.ndarray
+    """    
+    out: np.ndarray = np.empty_like(dc)
+    for pixel in prange(dc.shape[0]):
+        for band in prange(dc.shape[-1]):
+            out[pixel, :, band] = (dc[pixel, :, band] - np.nanmean(dc[pixel, :, band])) / np.nanstd(dc[pixel, :, band]) + eps
+    return out
 
 
 class Models(Enum):
     """
     Known model types.
     """
-    UNDEFINED = 0
-    LSTM = 1
-    TRANSFORMER = 2
-    SBERT = 3
+    LSTM = 0
+    TRANSFORMER = 1
+    SBERT = 2
+    UNDEFINED = 99
 
 
 class TensorDataCube:
@@ -37,6 +62,8 @@ class TensorDataCube:
         start: Optional[int],
         cutoff: int,
         inference_type: Models,
+        mask_dir: Optional[Path],
+        mask_glob: str,
         row_step: Optional[int] = None,
         column_step: Optional[int] = None,
         sequence_length: Optional[int] = None,
@@ -50,12 +77,15 @@ class TensorDataCube:
         self.row_step: Optional[int] = row_step
         self.column_step: Optional[int] = column_step
         self.sequence_length: Optional[int] = sequence_length
+        self.forestmask = ForestMask(mask_dir, tile_id, mask_glob)
 
         self.cube_inputs: Optional[List[str]] = None
         self.image_info: Optional[Dict] = None
         self.output_metadata: Optional[Dict] = None
 
     def self_prep(self) -> None:
+        warn(("Only front padding implemented currently. I.e. If DC is your datacube and n < seq, the first n-seq "
+              "items are filled with NAs and only the last seq-many items are valid observations"))
         tile_paths: List[str] = [str(p) for p in (self.input_directory / self.tile_id).glob(self.input_glob)]
         if self.start:
             self.cube_inputs = [
@@ -91,19 +121,26 @@ class TensorDataCube:
     def __iter__(self):
         for row in range(0, self.image_info["tile_height"], self.row_step):
             for col in range(0, self.image_info["tile_width"], self.column_step):
-                s2_cube_np: np.ndarray = np.empty(
-                    (len(self.cube_inputs), self.image_info["input_bands"], self.row_step, self.column_step),
-                    dtype=np.float32,
+                mask: Optional[np.ndarray] = self.forestmask.get_mask(row, row + self.row_step, col, col + self.column_step)
+
+                s2_cube_np: np.ndarray = np.full(
+                    (self.sequence_length, self.image_info["input_bands"], self.row_step, self.column_step),
+                    np.nan,
+                    dtype=np.float32
                 )
-                for index, cube_input in enumerate(self.cube_inputs):
+
+                index_offset = 0 if (diff := self.sequence_length - len(self.cube_inputs)) < 0 else abs(diff)
+                for _, (index, cube_input) in zip(range(self.sequence_length), enumerate(self.cube_inputs, start=index_offset)):
+                    """
+                    Zipping by sequences ensures that at mose sequence_length many observations are read.
+                    This makes padding further down below unnecessary!
+                    """
                     ds: Union[Dataset, DataArray] = rxr.open_rasterio(cube_input)
                     clipped_ds = ds.isel(y=slice(row, row + self.row_step), x=slice(col, col + self.column_step))
                     s2_cube_np[index] = clipped_ds.to_numpy()
                     ds.close()
                     del clipped_ds
 
-                # TODO broadcast arrays to (-1, obs, bands) before standardizing. Remember to reorder to (2,3,0,1) beforehand.
-                # This would remove a couple of reshaping/transposing steps and might speed up the code
                 if self.inference_type == Models.TRANSFORMER:
                     _t: Tuple[List[Union[datetime, float]], List[bool]] = TensorDataCube.pad_doy_sequence(
                         self.sequence_length,
@@ -113,70 +150,67 @@ class TensorDataCube:
                     sensing_doys, sbert_mask = _t
                     sensing_doys_np: np.ndarray = np.array(sensing_doys)
                     sensing_doys_np = sensing_doys_np.reshape((self.sequence_length, 1, 1, 1))
-                    sensing_doys_np = np.repeat(sensing_doys_np, self.row_step, axis=2)  # match actual data cube
+                    sensing_doys_np = np.repeat(sensing_doys_np, self.row_step, axis=2)     # match actual data cube
                     sensing_doys_np = np.repeat(sensing_doys_np, self.column_step, axis=3)  # match actual data cube
+
+                    # lines below needed now for compatability with SBERT datacube
+                    s2_cube_np = s2_cube_np.transpose((2, 3, 0, 1))
+                    s2_cube_np = s2_cube_np.reshape((-1, *s2_cube_np.shape[2:]))
+                    sensing_doys_np = sensing_doys_np.transpose((2, 3, 0, 1))
+                    sensing_doys_np = sensing_doys_np.reshape((-1, *sensing_doys_np.shape[2:]))
                 elif self.inference_type == Models.SBERT:
-                    s2_cube_np = np.transpose(s2_cube_np, (2, 3, 0, 1))
                     # Goal: move all valid observations to the "front" of the data cube (i.e. lower indices)
-                    # This is a "batch" operation of what Chris does sequentially
-                    s2_cube_np = np.where(s2_cube_np == -9999, np.nan, s2_cube_np)
+                    s2_cube_np = np.transpose(s2_cube_np, (2, 3, 0, 1))
+                    s2_cube_np[s2_cube_np == -9999] = np.nan
                     s2_cube_np = np.reshape(s2_cube_np, (-1, *s2_cube_np.shape[2:]))
-                    pixels, observations, bands = s2_cube_np.shape
+                    pixels, sequence_length, bands = s2_cube_np.shape
                     observations_without_nodata: np.ndarray = ~np.isnan(s2_cube_np).any(axis=2)
                     s2_cube_np[~observations_without_nodata] = np.nan
-                    index_array = np.arange(observations).reshape((1, observations, 1)).repeat(pixels, axis=0)
-                    index_array[observations_without_nodata] -= observations * 2
+                    index_array = np.arange(sequence_length).reshape((1, sequence_length, 1)).repeat(pixels, axis=0)
+                    index_array[observations_without_nodata] -= sequence_length * 2
                     # sorting_keys is now an array where for each pixel, the indices are sorted such that all non-nan observations are followed by all nan observations.
                     # Within the respective groups, ordering is kept by observation date
                     sorting_keys = index_array.argsort(axis=1)
                     s2_cube_np = np.take_along_axis(s2_cube_np, sorting_keys, axis=1)  # actually move data
 
-                    sbert_mask = ~np.isnan(s2_cube_np).any(axis=2).reshape((pixels, observations, 1))
-                    sensing_dates_as_ordinal = [TensorDataCube.ordinal_observation(i) for i in self.cube_inputs]
-                    sensing_doys_np = np.array(sensing_dates_as_ordinal).reshape((1, observations, 1)).repeat(pixels, axis=0)
+                    sbert_mask = ~np.isnan(s2_cube_np).any(axis=2).reshape((pixels, sequence_length, 1))
+
+                    sensing_dates_as_ordinal: np.ndarray = np.zeros((sequence_length,), dtype=np.int32)
+                    sensing_dates_as_ordinal[index_offset:] = [TensorDataCube.ordinal_observation(i) for i in self.cube_inputs]
+                    sensing_doys_np = sensing_dates_as_ordinal.reshape((1, sequence_length, 1)).repeat(pixels, axis=0)
                     sensing_doys_np = np.take_along_axis(sensing_doys_np, sorting_keys, axis=1)
-                    doy_of_earliest_observations = TensorDataCube.toyday(sensing_doys_np[:, 0, 0]).reshape((pixels, 1)).repeat(observations, axis=1)
-                    sensing_doys_np = (sensing_doys_np[..., 0] - sensing_doys_np[:, 0].repeat(observations, axis=1) + doy_of_earliest_observations).reshape((pixels, observations, 1))
+                    doy_of_earliest_observations = TensorDataCube.toyday(sensing_doys_np[:, 0, 0]).reshape((pixels, 1)).repeat(sequence_length, axis=1)
+                    sensing_doys_np = (sensing_doys_np[..., 0] - sensing_doys_np[:, 0].repeat(sequence_length, axis=1) + doy_of_earliest_observations).reshape((pixels, sequence_length, 1))
                     sensing_doys_np[~sbert_mask] = 0
                     
-                    # First reshape from -1, obs, bands to x, y, obs, bands to retain row order. Secondly, transpose to original order obs, bands, x, y for congruence with
-                    # later code -- TO BE CHANGED
-                    #
-                    # at this point in time it's still possible for doys and true_observations to contain more or less observations than sequence length permits
-                    s2_cube_np = np.reshape(s2_cube_np, (self.row_step, self.column_step, len(self.cube_inputs), self.image_info["input_bands"])).transpose((2,3,0,1))
-                    # TODO check if sbert_mask and sensing_doy are correct!
-                    sbert_mask = sbert_mask.astype(int).reshape((self.row_stel, self.column_step, len(self.cube_inputs), 1)).transpose((2,3,0,1))
-                    sensing_doys_np = sensing_doys_np.reshape((self.row_step, self.column_step, len(self.cube_inputs), 1)).transpose((2,3,0,1))
-
-                    sbert_mask = TensorDataCube.pad_datacube(self.sequence_length, sbert_mask, 0)
-                    sensing_doys_np = TensorDataCube.pad_datacube(self.sequence_length, sensing_doys_np, 0)
-
-                if self.inference_type in [Models.TRANSFORMER, Models.SBERT]:
-                    # assumes s2_cube_np is padded with np.nan
-                    s2_cube_np = TensorDataCube.pad_datacube(self.sequence_length, s2_cube_np)
-                    s2_cube_np = (s2_cube_np - np.nanmean(s2_cube_np, axis=0)) / np.nanstd(s2_cube_np, axis=0) + 1e-6  # normalize across bands, dont touch DOYs
-                    s2_cube_np = np.where(np.isnan(s2_cube_np), 0.0, s2_cube_np)
-                    s2_cube_np = np.concatenate((s2_cube_np, sensing_doys_np), axis=1)
-
-                s2_cube_npt: np.ndarray = np.transpose(s2_cube_np, (2, 3, 0, 1))
-                s2_cube_torch: Union[torch.Tensor, torch.masked.masked_tensor] = torch.from_numpy(s2_cube_npt).float()
+                    sbert_mask = TensorDataCube.pad_long_datacube(self.sequence_length, sbert_mask, 0)
+                    sensing_doys_np = TensorDataCube.pad_long_datacube(self.sequence_length, sensing_doys_np, 0)
+                
+                if self.inference_type in [Models.TRANSFORMER, Models.SBERT]:  # takes ~7 seconds without mask
+                    if mask is not None:
+                        s2_cube_np[mask] = znorm_PSB(s2_cube_np[mask])
+                    else:
+                        s2_cube_np = znorm_PSB(s2_cube_np)
+                    s2_cube_np[np.isnan(s2_cube_np)] = 0.0
 
                 if self.inference_type == Models.SBERT:
-                    # such, that ugly transposing is not needed in main inference script
-                    sbert_mask = np.transpose(sbert_mask, (2, 3, 0, 1))
-                    s2_cube_torch = torch.cat([s2_cube_torch, torch.from_numpy(sbert_mask)], dim=3)
+                    cube_and_doys = np.concatenate([s2_cube_np, sensing_doys_np, sbert_mask], axis=2)  # 11 seconds
+                elif self.inference_type == Models.TRANSFORMER:
+                    cube_and_doys = np.concatenate([s2_cube_np, sensing_doys_np], axis=2)  # 6.7 seonds
+                elif self.inference_type == Models.LSTM:
+                    cube_and_doys = s2_cube_np
+                
+                s2_cube_torch: torch.Tensor = torch.from_numpy(cube_and_doys).float()
 
                 try:
                     del s2_cube_np
-                    del s2_cube_npt
                     del sensing_doys
+                    del sbert_mask
                 except UnboundLocalError:
                     pass
 
-                yield s2_cube_torch, sbert_mask, row, col
+                yield s2_cube_torch, mask, row, col
 
-    def __str__(self) -> str:
-        pass
 
     def empty_output(self, dtype: torch.dtype=torch.long) -> torch.Tensor:
         return torch.full(
@@ -188,7 +222,7 @@ class TensorDataCube:
 
     @classmethod
     def to_dataloader(cls, chunk: torch.Tensor, batch_size: int, workers: int = 4) -> DataLoader:
-        ds: TensorDataset = TensorDataset(torch.reshape(chunk, (-1, chunk.shape[2], chunk.shape[3])))  # TensorDataset splits along first dimension of input
+        ds: TensorDataset = TensorDataset(chunk)  # TensorDataset splits along first dimension of input
         return DataLoader(ds, batch_size=batch_size, pin_memory=True, num_workers=workers, persistent_workers=True)
 
 
@@ -213,14 +247,43 @@ class TensorDataCube:
     def pad_datacube(cls, target: int, datacube: np.ndarray, pad_value=np.nan) -> np.ndarray:
         diff: int = target - datacube.shape[0]
         if diff < 0:
+            # TODO should also be abs(diff) - 1? is the offset by one even correct?
+            #  Construction of DC above indicates that it's not correct!
             datacube = np.delete(datacube, list(range(abs(diff))), axis=0)  # deletes oldest entries first
         elif diff > 0:
-            datacube = np.pad(datacube, ((0, diff), (0, 0), (0, 0), (0, 0)), constant_values=pad_value)
+            datacube = np.pad(datacube, ((0, diff), (0, 0), (0, 0), (0, 0)), constant_values=pad_value)  # should be end padding
 
         # TODO remove assertion for "production"
         assert target == datacube.shape[0]
 
         return datacube
+
+
+    @classmethod
+    def pad_long_datacube(cls, target: int, datacube: np.ndarray, pad_value: Union[int, float] = np.nan) -> np.ndarray:
+        """Pad datacube in (x * y, observations, bands)-format in axis of observations.
+
+        .. note:: Oldest items are deleted first, if datacube has more entries than sequence length.
+
+        :param target: Sequence length
+        :type target: int
+        :param datacube: Datacube to pad or crop
+        :type datacube: np.ndarray
+        :param pad_value: Value used for padding, defaults to np.nan
+        :type pad_value: Union[int, float], optional
+        :return: Datacube with second dimension expanded or shortened
+        :rtype: np.ndarray
+        """        
+        diff: int = target - datacube.shape[1]
+        if diff < 0:
+            datacube = np.delete(datacube, list(range(abs(diff) - 1)), axis=1)  # WAIT A SECOND, '- 1' IS WRONG?
+        elif diff > 0:
+            datacube = np.pad(datacube, ((0, 0), (diff, 0), (0, 0)), constant_values=pad_value)  # (diff, 0) is start padding instead of end padding; THIS WAS THE ERROR
+
+        assert target == datacube.shape[1]
+
+        return datacube
+
 
     @classmethod
     def fp_to_doy(cls, file_path: str, origin: Optional[str] = None) -> datetime:
