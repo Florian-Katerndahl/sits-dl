@@ -8,6 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from typing import Optional
+from time import time
 import numpy as np
 from sits_dl.tensordatacube import TensorDataCube as TDC
 
@@ -272,43 +273,39 @@ class SBERTClassification(nn.Module):
         return self.classification(x, mask)
 
 
-    @torch.inference_mode()
     def predict(self, dc: torch.Tensor, mask: Optional[np.ndarray], c_step: int, r_step: int, batch_size: int, device: torch.device, *args, **kwargs) -> torch.Tensor:
         dl: DataLoader = TDC.to_dataloader(dc, batch_size)
-        prediction: torch.Tensor = torch.full((r_step * c_step,), fill_value=TDC.OUTPUT_NODATA, dtype=torch.float)
+        prediction: torch.Tensor = torch.full((r_step * c_step,), fill_value=TDC.OUTPUT_NODATA, dtype=torch.float, device=device)
 
-        if mask is not None:
-            mask_long: torch.Tensor = torch.from_numpy(np.reshape(mask, (-1,))).bool()
-            for batch_index, batch in enumerate(dl):
-                for _, samples in enumerate(batch):
-                    start: int = batch_index * batch_size
-                    end: int = start + len(samples)
-                    subset: torch.Tensor = mask_long[start:end]
-                    if not torch.any(subset):
-                        next
-                    input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)  # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
-                    res = torch.sigmoid(
-                        self.forward(
-                            x=input_tensor[:,:,:-2],
-                            doy=input_tensor[:,:,-2].long(),
-                            mask=input_tensor[:,:,-1].long())
-                            ).cpu().squeeze()
-                    prediction[start:end][subset] = res
-        else:
-            for batch_index, batch in enumerate(dl):
-                for _, samples in enumerate(batch):
-                    start: int = batch_index * batch_size
-                    end: int = start + len(samples)
-                    samples = samples.to(device, non_blocking=True)
-                    res = torch.sigmoid(
-                        self.forward(
-                            x=samples[:,:,:-2],
-                            doy=samples[:,:,-2].long(),
-                            mask=samples[:,:,-1].long())
-                            ).cpu().squeeze()
-                    prediction[start:end] = res
+        with torch.inference_mode():
+            if mask is not None:
+                mask_torch: torch.Tensor = torch.from_numpy(mask).bool()
+                for batch_index, batch in enumerate(dl):
+                    for _, samples in enumerate(batch):
+                        start: int = batch_index * batch_size
+                        end: int = start + len(samples)
+                        subset: torch.Tensor = mask_torch[start:end]
+                        if not torch.any(subset):  # does skipping actually give a spped improvement? Or does it slow inference down since t(checking for null) > t(predicting null vector)
+                            next
+                        input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)  # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
+                        res = self.forward(
+                                x=input_tensor[:,:,:-2],
+                                doy=input_tensor[:,:,-2].long(),
+                                mask=input_tensor[:,:,-1].long()).squeeze()
+                        prediction[start:end][subset] = res
+            else:
+                for batch_index, batch in enumerate(dl):
+                    for _, samples in enumerate(batch):
+                        start: int = batch_index * batch_size
+                        end: int = start + len(samples)
+                        samples = samples.to(device, non_blocking=True)
+                        res = self.forward(
+                                x=samples[:,:,:-2],
+                                doy=samples[:,:,-2].long(),
+                                mask=samples[:,:,-1].long()).squeeze()
+                        prediction[start:end] = res
 
-        return torch.reshape(prediction, (r_step, c_step))
+        return torch.reshape(prediction, (r_step, c_step)).sigmoid().cpu()
 
 
 class MulticlassClassification(nn.Module):
