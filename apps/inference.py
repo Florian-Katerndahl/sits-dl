@@ -207,8 +207,8 @@ def main() -> int:
         inference_type = Models.SBERT
         inference_model = SBERTClassification(SBERT(**SBERTArgs), **SBERTClassArgs)
         inference_model.load_state_dict(checkpoint["model_state_dict"])
-        inference_model.to(device)
         inference_model.eval()
+        inference_model.to(device)
 
         if cli_args.get("mgpu"):
             inference_model = DataParallel(inference_model)
@@ -230,33 +230,17 @@ def main() -> int:
             cli_args.get("date_begin"),
             cli_args.get("date_end"),
             inference_type,
+            cli_args.get("masks"),
+            cli_args.get("mglob"),
             cli_args.get("row-block"),
             cli_args.get("col-block"),
-            cli_args.get("sequence"),
+            cli_args.get("sequence")
         )
         tdc.self_prep()
         output_torch: torch.Tensor = tdc.empty_output(torch.float if inference_type == Models.SBERT else torch.long)
 
-        for chunk, true_obs, row, col in tdc:
+        for chunk, mask, row, col in tdc:
             r_start, r_end, c_start, c_end = row, row + tdc.row_step, col, col + tdc.column_step
-            mask: Optional[np.ndarray] = None
-
-            if cli_args.get("masks"):
-                mask_dir: Path = cli_args.get("masks") / tile
-                if not mask_dir.exists():
-                    mask_dir = mask_dir.parent
-
-                try:
-                    mask_path: str = str(list(mask_dir.glob(cli_args.get("mglob"))).pop())
-                except IndexError:
-                    raise RuntimeError("Provided mask directory and name but could not find any files")
-
-                with rxr.open_rasterio(mask_path) as ds:
-                    mask_ds: xarray.Dataset = ds.isel(
-                        y=slice(row, row + tdc.row_step), x=slice(col, col + tdc.column_step)
-                    )
-                    mask = np.squeeze(np.array(mask_ds, ndmin=2, dtype=np.bool_), axis=0)
-                    del mask_ds
 
             output_torch[r_start:r_end, c_start:c_end] = inference_model.predict(
                 chunk,
