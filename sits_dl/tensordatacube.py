@@ -182,11 +182,8 @@ class TensorDataCube:
                     doy_of_earliest_observations = TensorDataCube.toyday(sensing_doys_np[:, 0, 0]).reshape((pixels, 1)).repeat(sequence_length, axis=1)
                     sensing_doys_np = (sensing_doys_np[..., 0] - sensing_doys_np[:, 0].repeat(sequence_length, axis=1) + doy_of_earliest_observations).reshape((pixels, sequence_length, 1))
                     sensing_doys_np[~sbert_mask] = 0
-                    
-                    sbert_mask = TensorDataCube.pad_long_datacube(self.sequence_length, sbert_mask, 0)
-                    sensing_doys_np = TensorDataCube.pad_long_datacube(self.sequence_length, sensing_doys_np, 0)
                 
-                if self.inference_type in [Models.TRANSFORMER, Models.SBERT]:  # takes ~7 seconds without mask
+                if self.inference_type in [Models.TRANSFORMER, Models.SBERT]:
                     if mask is not None:
                         s2_cube_np[mask] = znorm_PSB(s2_cube_np[mask])
                     else:
