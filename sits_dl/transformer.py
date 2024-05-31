@@ -124,12 +124,12 @@ class TransformerClassifier(nn.Module):
         prediction: torch.Tensor = torch.full((r_step * c_step,), fill_value=TDC.OUTPUT_NODATA, dtype=torch.long)
 
         if mask is not None:
-            mask_long: torch.Tensor = torch.from_numpy(np.reshape(mask, (-1,))).bool()
+            mask_torch: torch.Tensor = torch.from_numpy(mask).bool()
             for batch_index, batch in enumerate(dl):
                 for _, samples in enumerate(batch):
                     start: int = batch_index * batch_size
                     end: int = start + len(samples)
-                    subset: torch.Tensor = mask_long[start:end]
+                    subset: torch.Tensor = mask_torch[start:end]
                     if not torch.any(subset):
                         next
                     input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)  # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
