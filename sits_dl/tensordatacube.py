@@ -14,8 +14,6 @@ import rioxarray as rxr
 from xarray import Dataset, DataArray
 from sits_dl.forestmask import ForestMask
 
-# TODO https://numba.pydata.org/numba-doc/latest/user/parallel.html?highlight=prange#explicit-parallel-loops
-#   does this mean I invoke a race condition below?
 @njit(['float32[:,:,:](float32[:,:,:], Omitted(1e-6))', 'float32[:,:,:](float32[:,:,:], float32)'], parallel=True)
 def znorm_PSB(dc: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """Apply z-normalization to data cube per pixel and per band.
@@ -34,6 +32,37 @@ def znorm_PSB(dc: np.ndarray, eps: float = 1e-6) -> np.ndarray:
         for band in prange(dc.shape[-1]):
             out[pixel, :, band] = (dc[pixel, :, band] - np.nanmean(dc[pixel, :, band])) / np.nanstd(dc[pixel, :, band]) + eps
     return out
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def nanstd_psb_t(dc: torch.Tensor, dim: int, keepdim: bool = True) -> torch.Tensor:
+    return (dc - torch.nanmean(dc, dim=dim, keepdim=keepdim)).square().nanmean(dim=dim, keepdim=keepdim).sqrt()
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def znorm_psb_t(dc: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    _mean: torch.Tensor = torch.nanmean(dc, dim=1, keepdim=True)
+    _std = (dc - _mean).square().nanmean(dim=1, keepdim=True).sqrt()
+    normed = (dc - _mean) / _std + eps
+    return normed
+
+
+@torch.compile()
+def preprocess_sbert(dc: np.ndarray, device: torch.device) -> torch.Tensor:
+    dc_t: torch.Tensor = torch.from_numpy(dc).to(device=device).permute(2, 3, 0, 1).reshape((-1, *dc.shape[:2]))
+    dc_t[dc_t == -9999] = torch.nan
+    pixels, sequence_length, bands = dc_t.shape
+    observations_without_nodata: torch.Tensor = ~dc_t.isnan().any(dim=2).to(device=device)
+    dc_t[observations_without_nodata] = torch.nan
+    index_array: torch.Tensor = torch.arange(sequence_length).reshape((1, sequence_length, 1)).repeat_interleave(pixels, dim=0).to(device=device)
+    index_array[observations_without_nodata] -= sequence_length * 2
+    sorting_keys: torch.Tensor = index_array.argsort(dim=1)
+    dc_t = dc_t.take_along_dim(sorting_keys, dim=1)
+
+    del pixels, sequence_length, bands, index_array
+    # print(torch.mean(dc_t, dim=1), torch.std(dc_t, dim=1))
+
+    return dc_t, sorting_keys
 
 
 class Models(Enum):
@@ -64,6 +93,7 @@ class TensorDataCube:
         inference_type: Models,
         mask_dir: Optional[Path],
         mask_glob: str,
+        device: torch.device,
         row_step: Optional[int] = None,
         column_step: Optional[int] = None,
         sequence_length: Optional[int] = None,
@@ -78,6 +108,7 @@ class TensorDataCube:
         self.column_step: Optional[int] = column_step
         self.sequence_length: Optional[int] = sequence_length
         self.forestmask = ForestMask(mask_dir, tile_id, mask_glob)
+        self.device = device
 
         self.cube_inputs: Optional[List[str]] = None
         self.image_info: Optional[Dict] = None
@@ -121,6 +152,7 @@ class TensorDataCube:
     def __iter__(self):
         for row in range(0, self.image_info["tile_height"], self.row_step):
             for col in range(0, self.image_info["tile_width"], self.column_step):
+                t_chunk = time()
                 mask: Optional[np.ndarray] = self.forestmask.get_mask(row, row + self.row_step, col, col + self.column_step)
 
                 s2_cube_np: np.ndarray = np.full(
@@ -130,6 +162,8 @@ class TensorDataCube:
                 )
 
                 index_offset = 0 if (diff := self.sequence_length - len(self.cube_inputs)) < 0 else abs(diff)
+                if index_offset == 0:
+                    self.cube_inputs = self.cube_inputs[-diff:]
                 for _, (index, cube_input) in zip(range(self.sequence_length), enumerate(self.cube_inputs, start=index_offset)):
                     """
                     Zipping by sequences ensures that at mose sequence_length many observations are read.
@@ -139,7 +173,7 @@ class TensorDataCube:
                     clipped_ds = ds.isel(y=slice(row, row + self.row_step), x=slice(col, col + self.column_step))
                     s2_cube_np[index] = clipped_ds.to_numpy()
                     ds.close()
-                    del clipped_ds
+                    del ds, clipped_ds
 
                 if self.inference_type == Models.TRANSFORMER:
                     _t: Tuple[List[Union[datetime, float]], List[bool]] = TensorDataCube.pad_doy_sequence(
@@ -160,53 +194,56 @@ class TensorDataCube:
                     sensing_doys_np = sensing_doys_np.reshape((-1, *sensing_doys_np.shape[2:]))
                 elif self.inference_type == Models.SBERT:
                     # Goal: move all valid observations to the "front" of the data cube (i.e. lower indices)
-                    s2_cube_np = np.transpose(s2_cube_np, (2, 3, 0, 1))
-                    s2_cube_np[s2_cube_np == -9999] = np.nan
-                    s2_cube_np = np.reshape(s2_cube_np, (-1, *s2_cube_np.shape[2:]))
-                    pixels, sequence_length, bands = s2_cube_np.shape
-                    observations_without_nodata: np.ndarray = ~np.isnan(s2_cube_np).any(axis=2)
-                    s2_cube_np[~observations_without_nodata] = np.nan
-                    index_array = np.arange(sequence_length).reshape((1, sequence_length, 1)).repeat(pixels, axis=0)
-                    index_array[observations_without_nodata] -= sequence_length * 2
-                    # sorting_keys is now an array where for each pixel, the indices are sorted such that all non-nan observations are followed by all nan observations.
-                    # Within the respective groups, ordering is kept by observation date
-                    sorting_keys = index_array.argsort(axis=1)
-                    s2_cube_np = np.take_along_axis(s2_cube_np, sorting_keys, axis=1)  # actually move data
+                    # TODO rewrite to use torch tensors??
+                    # test_np = s2_cube_np.copy()
+                    # t444 = time()
+                    # s2_cube_np = np.transpose(s2_cube_np, (2, 3, 0, 1))
+                    # s2_cube_np[s2_cube_np == -9999] = np.nan
+                    # s2_cube_np = np.reshape(s2_cube_np, (-1, *s2_cube_np.shape[2:]))
+                    # pixels, sequence_length, bands = s2_cube_np.shape
+                    # observations_without_nodata: np.ndarray = ~np.isnan(s2_cube_np).any(axis=2)
+                    # s2_cube_np[~observations_without_nodata] = np.nan
+                    # index_array = np.arange(sequence_length).reshape((1, sequence_length, 1)).repeat(pixels, axis=0)
+                    # index_array[observations_without_nodata] -= sequence_length * 2
+                    # # sorting_keys is now an array where for each pixel, the indices are sorted such that all non-nan observations are followed by all nan observations.
+                    # # Within the respective groups, ordering is kept by observation date
+                    # sorting_keys = index_array.argsort(axis=1)
+                    # s2_cube_np = np.take_along_axis(s2_cube_np, sorting_keys, axis=1)  # actually move data
+                    # print(time() - t444)
 
-                    sbert_mask = ~np.isnan(s2_cube_np).any(axis=2).reshape((pixels, sequence_length, 1))
+                    s2_cube_np, sorting_keys = preprocess_sbert(s2_cube_np, self.device)
+                    pixels, sequence_length, _ = s2_cube_np.shape
+                    print(s2_cube_np.shape)
+
+                    sbert_mask = ~s2_cube_np.isnan().any(dim=2).reshape((pixels, sequence_length, 1))
 
                     sensing_dates_as_ordinal: np.ndarray = np.zeros((sequence_length,), dtype=np.int32)
                     sensing_dates_as_ordinal[index_offset:] = [TensorDataCube.ordinal_observation(i) for i in self.cube_inputs]
                     sensing_doys_np = sensing_dates_as_ordinal.reshape((1, sequence_length, 1)).repeat(pixels, axis=0)
-                    sensing_doys_np = np.take_along_axis(sensing_doys_np, sorting_keys, axis=1)
+                    sensing_doys_np = np.take_along_axis(sensing_doys_np, sorting_keys.numpy(force=True), axis=1)
                     doy_of_earliest_observations = TensorDataCube.toyday(sensing_doys_np[:, 0, 0]).reshape((pixels, 1)).repeat(sequence_length, axis=1)
                     sensing_doys_np = (sensing_doys_np[..., 0] - sensing_doys_np[:, 0].repeat(sequence_length, axis=1) + doy_of_earliest_observations).reshape((pixels, sequence_length, 1))
-                    sensing_doys_np[~sbert_mask] = 0
-                
+                    sensing_doys_np[~sbert_mask.numpy(force=True)] = 0
+
                 if self.inference_type in [Models.TRANSFORMER, Models.SBERT]:
-                    if mask is not None:
-                        s2_cube_np[mask] = znorm_PSB(s2_cube_np[mask])
-                    else:
-                        s2_cube_np = znorm_PSB(s2_cube_np)
-                    s2_cube_np[np.isnan(s2_cube_np)] = 0.0
+                    s2_cube_np = znorm_psb_t(s2_cube_np)
+                    s2_cube_np[s2_cube_np.isnan()] = 0.0
 
                 if self.inference_type == Models.SBERT:
-                    cube_and_doys = np.concatenate([s2_cube_np, sensing_doys_np, sbert_mask], axis=2)  # 11 seconds
+                    cube_and_doys = torch.cat([s2_cube_np, torch.from_numpy(sensing_doys_np).to(device=self.device), sbert_mask], dim=2)  # 11 seconds
+                    del sbert_mask, sensing_dates_as_ordinal, sensing_doys_np, \
+                        doy_of_earliest_observations, sorting_keys  # index_array, observations_without_nodata
                 elif self.inference_type == Models.TRANSFORMER:
-                    cube_and_doys = np.concatenate([s2_cube_np, sensing_doys_np], axis=2)  # 6.7 seonds
+                    cube_and_doys = torch.cat([s2_cube_np, torch.from_numpy(sensing_doys_np).to(device=self.device)], dim=2)  # 6.7 seonds
+                    del sensing_doys_no, sbert_mask, sensing_doys
                 elif self.inference_type == Models.LSTM:
                     cube_and_doys = s2_cube_np
                 
-                s2_cube_torch: torch.Tensor = torch.from_numpy(cube_and_doys).float()
+                # s2_cube_torch: torch.Tensor = torch.from_numpy(cube_and_doys).float()
 
-                try:
-                    del s2_cube_np
-                    del sensing_doys
-                    del sbert_mask
-                except UnboundLocalError:
-                    pass
+                # del s2_cube_np, cube_and_doys
 
-                yield s2_cube_torch, mask, row, col
+                yield cube_and_doys, mask, row, col, t_chunk
 
 
     def empty_output(self, dtype: torch.dtype=torch.long) -> torch.Tensor:
@@ -214,13 +251,13 @@ class TensorDataCube:
             [self.image_info["tile_height"], self.image_info["tile_width"]],
             fill_value=TensorDataCube.OUTPUT_NODATA,
             dtype=dtype,
+            device="cpu"
         )
     
 
     @classmethod
     def to_dataloader(cls, chunk: torch.Tensor, batch_size: int, workers: int = 4) -> DataLoader:
-        ds: TensorDataset = TensorDataset(chunk)  # TensorDataset splits along first dimension of input
-        return DataLoader(ds, batch_size=batch_size, pin_memory=True, num_workers=workers, persistent_workers=True)
+        return DataLoader(chunk, batch_size=batch_size, pin_memory=True, num_workers=workers, persistent_workers=False)
 
 
     @classmethod

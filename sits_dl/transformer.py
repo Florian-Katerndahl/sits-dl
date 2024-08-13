@@ -125,28 +125,26 @@ class TransformerClassifier(nn.Module):
 
         if mask is not None:
             mask_torch: torch.Tensor = torch.from_numpy(mask).bool()
-            for batch_index, batch in enumerate(dl):
-                for _, samples in enumerate(batch):
-                    start: int = batch_index * batch_size
-                    end: int = start + len(samples)
-                    subset: torch.Tensor = mask_torch[start:end]
-                    if not torch.any(subset):
-                        next
-                    input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)  # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
-                    _, data = torch.max(
-                        self.forward(input_tensor),
-                        dim=1
-                    )
-                    prediction[start:end][subset] = data.cpu()
+            for batch_index, samples in enumerate(dl):
+                start: int = batch_index * batch_size
+                end: int = start + len(samples)
+                subset: torch.Tensor = mask_torch[start:end]
+                if not torch.any(subset):
+                    next
+                input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)  # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
+                _, data = torch.max(
+                    self.forward(input_tensor),
+                    dim=1
+                )
+                prediction[start:end][subset] = data.cpu()
         else:
-            for batch_index, batch in enumerate(dl):
-                for _, samples in enumerate(batch):
-                    start: int = batch_index * batch_size
-                    end: int = start + len(samples)
-                    _, data = torch.max(
-                        self.forward(samples.to(device, non_blocking=True)),
-                        dim=1
-                    )
-                    prediction[start:end] = data.cpu()
+            for batch_index, samples in enumerate(dl):
+                start: int = batch_index * batch_size
+                end: int = start + len(samples)
+                _, data = torch.max(
+                    self.forward(samples.to(device, non_blocking=True)),
+                    dim=1
+                )
+                prediction[start:end] = data.cpu()
 
         return torch.reshape(prediction, (r_step, c_step))

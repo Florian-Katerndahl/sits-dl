@@ -2,6 +2,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from re import search
+import os
 from typing import List, Union, Dict, Optional
 import numpy as np
 import rasterio
@@ -9,6 +10,7 @@ import rioxarray as rxr
 import torch
 from torch.nn import DataParallel
 import torch.multiprocessing as mp
+from torch.utils.data import DataLoader
 import xarray
 import logging
 from time import time
@@ -149,7 +151,7 @@ def main() -> int:
         dest="batch-size",
         required=False,
         type=int,
-        default=1024,
+        default=512,
         help="Batch size used during inference when using Transformer DL models. Default is 1024.",
     )
     parser.add_argument(
@@ -182,7 +184,7 @@ def main() -> int:
         torch.set_num_threads(cli_args.get("cpus"))
         torch.set_num_interop_threads(cli_args.get("cpus"))
 
-    device: str = torch.device(cli_args.get("gpu") if torch.cuda.is_available() else "cpu")
+    device: torch.device = torch.device(cli_args.get("gpu") if torch.cuda.is_available() else "cpu")
 
     # FIXME this is somewhat ugly
     inference_model: Union[lstm.LSTMClassifier, transformer.TransformerClassifier, SBERTClassification]
@@ -209,6 +211,13 @@ def main() -> int:
         inference_model.load_state_dict(checkpoint["model_state_dict"])
         inference_model.eval()
         inference_model.to(device)
+        # compilation could be tweaked more, but this would also result in longer compilation times. Testing would be needed to see if the trade-off is worthwhile
+        # mode="max-autotune",
+        opt_model = torch.compile(inference_model, dynamic=False, fullgraph=False)
+        # opt_model = torch.compile(inference_model, dynamic=False, fullgraph=True,
+        #                           options={"cuda.enable_cuda_lto": True, "epilogue_fusion": True, "triton.cudagraphs": True, "shape_padding": True,
+        #                                    "trace.graph_diagram": False, "max_autotune": True, "compile_threads": os.cpu_count(), "aggressive_fusion": True,
+        #                                    "freezing": True, "triton.cudagraph_trees": True, "cuda.compile_opt_level": "-O3"})
 
         if cli_args.get("mgpu"):
             inference_model = DataParallel(inference_model)
@@ -232,26 +241,50 @@ def main() -> int:
             inference_type,
             cli_args.get("masks"),
             cli_args.get("mglob"),
+            device,
             cli_args.get("row-block"),
             cli_args.get("col-block"),
             cli_args.get("sequence")
         )
         tdc.self_prep()
-        output_torch: torch.Tensor = tdc.empty_output(torch.float if inference_type == Models.SBERT else torch.long)
+        output_torch: torch.Tensor = tdc.empty_output(torch.float16 if inference_type == Models.SBERT else torch.long)
 
-        for chunk, mask, row, col in tdc:
+        for chunk, mask, row, col, t_chunk in tdc:
+            # print("Iterating")
+            # print(chunk)
             r_start, r_end, c_start, c_end = row, row + tdc.row_step, col, col + tdc.column_step
+            batch_size = cli_args.get("batch-size")
+            dl = DataLoader(chunk, 
+                            batch_size=batch_size, 
+                            pin_memory=False if "cuda" in device.type else True, 
+                            num_workers=0 if "cuda" in device.type else os.cpu_count(), 
+                            persistent_workers=False)
+            prediction: torch.Tensor = torch.full((tdc.row_step * tdc.column_step,), fill_value=TensorDataCube.OUTPUT_NODATA, dtype=torch.float16, device=device)
+            
+            with torch.autocast(device_type="cuda", dtype=torch.float16), torch.inference_mode():
+                # This point is reached after approx. 2 minutes (30s reading, 40 seconds pre-processing, 11 seconds concatenating, 7 seconds normalization) when using numpy/numba
+                for batch_index, batch in enumerate(dl):
+                    start: int = batch_index * batch_size
+                    end: int = start + len(batch)
+                    input_tensor: torch.Tensor = batch.to(device, non_blocking=True)
+                    res = opt_model(
+                            x=input_tensor[:,:,:-2],
+                            doy=input_tensor[:,:,-2].int(),
+                            mask=input_tensor[:,:,-1].int()).squeeze()
+                    prediction[start:end] = res
+            output_torch[r_start:r_end, c_start:c_end] = torch.reshape(prediction, (tdc.row_step, tdc.column_step)).sigmoid().cpu()
+            # output_torch[r_start:r_end, c_start:c_end] = inference_model.predict(
+            #     chunk,
+            #     mask,
+            #     tdc.column_step,
+            #     tdc.row_step,
+            #     cli_args.get("batch-size"),
+            #     device
+            # )
 
-            output_torch[r_start:r_end, c_start:c_end] = inference_model.predict(
-                chunk,
-                mask,
-                tdc.column_step,
-                tdc.row_step,
-                cli_args.get("batch-size"),
-                device
-            )
+            del chunk, mask
 
-            del chunk
+            print(f"Chunk took {(time() - t_chunk)/60.0:.4f} minutes")
 
         output_numpy: np.array = output_torch.numpy(force=True)
 

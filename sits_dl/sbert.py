@@ -143,7 +143,7 @@ class Attention(nn.Module):
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(query.size(-1))
 
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            scores = scores.masked_fill(mask == 0, -1e4 if scores.dtype == torch.float16 else -1e9)
 
         p_attn = F.softmax(scores, dim=-1)
 
@@ -268,6 +268,7 @@ class SBERTClassification(nn.Module):
             self.sbert.hidden, num_classes, seq_len
         )
 
+    # @torch.autocast(device_type="cuda", dtype=torch.float16)  # can this hard-coded device be changed?  Only if I use it as a context manager in predict function and not as a decrorator, right?
     def forward(self, x, doy, mask):
         x = self.sbert(x, doy, mask)
         return self.classification(x, mask)
@@ -275,35 +276,37 @@ class SBERTClassification(nn.Module):
 
     def predict(self, dc: torch.Tensor, mask: Optional[np.ndarray], c_step: int, r_step: int, batch_size: int, device: torch.device, *args, **kwargs) -> torch.Tensor:
         dl: DataLoader = TDC.to_dataloader(dc, batch_size)
-        prediction: torch.Tensor = torch.full((r_step * c_step,), fill_value=TDC.OUTPUT_NODATA, dtype=torch.float, device=device)
+        prediction: torch.Tensor = torch.full((r_step * c_step,), fill_value=TDC.OUTPUT_NODATA, dtype=torch.float16, device=device)
 
-        with torch.inference_mode():
+        with torch.autocast(device_type="cuda" if "cuda" in device.type else "cpu", dtype=torch.float16), torch.inference_mode():
             if mask is not None:
                 mask_torch: torch.Tensor = torch.from_numpy(mask).bool()
-                for batch_index, batch in enumerate(dl):
-                    for _, samples in enumerate(batch):
-                        start: int = batch_index * batch_size
-                        end: int = start + len(samples)
-                        subset: torch.Tensor = mask_torch[start:end]
-                        if not torch.any(subset):  # does skipping actually give a spped improvement? Or does it slow inference down since t(checking for null) > t(predicting null vector)
-                            next
-                        input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)  # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
-                        res = self.forward(
-                                x=input_tensor[:,:,:-2],
-                                doy=input_tensor[:,:,-2].long(),
-                                mask=input_tensor[:,:,-1].long()).squeeze()
-                        prediction[start:end][subset] = res
+                for batch_index, samples in enumerate(dl):
+                    start: int = batch_index * batch_size
+                    end: int = start + len(samples)
+                    subset: torch.Tensor = mask_torch[start:end]
+                    if not torch.any(subset):  # does skipping actually give a spped improvement? Or does it slow inference down since t(checking for null) > t(predicting null vector)
+                        next
+                    # ordering of subsetting and moving makes little to no difference time-wise but big difference memory-wise
+                    input_tensor: torch.Tensor = samples[subset].to(device, non_blocking=True)
+                    res = self.forward(
+                            x=input_tensor[:,:,:-2],
+                            doy=input_tensor[:,:,-2].int(),
+                            mask=input_tensor[:,:,-1].int()).squeeze()
+                    prediction[start:end][subset] = res
+                del mask_torch, subset, input_tensor  # delete in every iteration? Delete at all?
             else:
-                for batch_index, batch in enumerate(dl):
-                    for _, samples in enumerate(batch):
-                        start: int = batch_index * batch_size
-                        end: int = start + len(samples)
-                        samples = samples.to(device, non_blocking=True)
-                        res = self.forward(
-                                x=samples[:,:,:-2],
-                                doy=samples[:,:,-2].long(),
-                                mask=samples[:,:,-1].long()).squeeze()
-                        prediction[start:end] = res
+                for batch_index, samples in enumerate(dl):
+                    start: int = batch_index * batch_size
+                    end: int = start + len(samples)
+                    samples = samples.to(device, non_blocking=True)
+                    res = self.forward(
+                            x=samples[:,:,:-2],
+                            doy=samples[:,:,-2].int(),
+                            mask=samples[:,:,-1].int()).squeeze()
+                    prediction[start:end] = res
+        
+        del dl, samples, res  # delete in every iteration? Delete at all?
 
         return torch.reshape(prediction, (r_step, c_step)).sigmoid().cpu()
 
