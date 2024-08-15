@@ -250,8 +250,6 @@ def main() -> int:
         output_torch: torch.Tensor = tdc.empty_output(torch.float16 if inference_type == Models.SBERT else torch.long)
 
         for chunk, mask, row, col, t_chunk in tdc:
-            # print("Iterating")
-            # print(chunk)
             r_start, r_end, c_start, c_end = row, row + tdc.row_step, col, col + tdc.column_step
             batch_size = cli_args.get("batch-size")
             dl = DataLoader(chunk, 
@@ -272,6 +270,8 @@ def main() -> int:
                             doy=input_tensor[:,:,-2].int(),
                             mask=input_tensor[:,:,-1].int()).squeeze()
                     prediction[start:end] = res
+            if mask is not None:
+                prediction[mask] = torch.nan
             output_torch[r_start:r_end, c_start:c_end] = torch.reshape(prediction, (tdc.row_step, tdc.column_step)).sigmoid().cpu()
             # output_torch[r_start:r_end, c_start:c_end] = inference_model.predict(
             #     chunk,
