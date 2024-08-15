@@ -259,7 +259,8 @@ def main() -> int:
                             persistent_workers=False)
             prediction: torch.Tensor = torch.full((tdc.row_step * tdc.column_step,), fill_value=TensorDataCube.OUTPUT_NODATA, dtype=torch.float16, device=device)
             
-            with torch.autocast(device_type="cuda", dtype=torch.float16), torch.inference_mode():
+            # If the model is compiled, there's no need for any methods from the supplied model
+            with torch.autocast(device_type=device.type, dtype=torch.float16), torch.inference_mode():
                 # This point is reached after approx. 2 minutes (30s reading, 40 seconds pre-processing, 11 seconds concatenating, 7 seconds normalization) when using numpy/numba
                 for batch_index, batch in enumerate(dl):
                     start: int = batch_index * batch_size
@@ -272,15 +273,8 @@ def main() -> int:
                     prediction[start:end] = res
             if mask is not None:
                 prediction[mask] = torch.nan
+            # WARNING this hardcodes SBERT, removing the sigmoid would make it 
             output_torch[r_start:r_end, c_start:c_end] = torch.reshape(prediction, (tdc.row_step, tdc.column_step)).sigmoid().cpu()
-            # output_torch[r_start:r_end, c_start:c_end] = inference_model.predict(
-            #     chunk,
-            #     mask,
-            #     tdc.column_step,
-            #     tdc.row_step,
-            #     cli_args.get("batch-size"),
-            #     device
-            # )
 
             del chunk, mask
 
