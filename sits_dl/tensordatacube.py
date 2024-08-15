@@ -53,16 +53,18 @@ def preprocess_sbert(dc: np.ndarray, device: torch.device) -> torch.Tensor:
     dc_t[dc_t == -9999] = torch.nan
     pixels, sequence_length, bands = dc_t.shape
     observations_without_nodata: torch.Tensor = ~dc_t.isnan().any(dim=2).to(device=device)
-    dc_t[observations_without_nodata] = torch.nan
+    dc_t[~observations_without_nodata] = torch.nan
     index_array: torch.Tensor = torch.arange(sequence_length).reshape((1, sequence_length, 1)).repeat_interleave(pixels, dim=0).to(device=device)
     index_array[observations_without_nodata] -= sequence_length * 2
     sorting_keys: torch.Tensor = index_array.argsort(dim=1)
     dc_t = dc_t.take_along_dim(sorting_keys, dim=1)
 
+    sbert_mask = ~dc_t.isnan().any(dim=2).reshape((pixels, sequence_length, 1))
+
     del pixels, sequence_length, bands, index_array
     # print(torch.mean(dc_t, dim=1), torch.std(dc_t, dim=1))
 
-    return dc_t, sorting_keys
+    return dc_t, sorting_keys, sbert_mask
 
 
 class Models(Enum):
@@ -209,13 +211,13 @@ class TensorDataCube:
                     # # Within the respective groups, ordering is kept by observation date
                     # sorting_keys = index_array.argsort(axis=1)
                     # s2_cube_np = np.take_along_axis(s2_cube_np, sorting_keys, axis=1)  # actually move data
-                    # print(time() - t444)
 
-                    s2_cube_np, sorting_keys = preprocess_sbert(s2_cube_np, self.device)
+                    s2_cube_np, sorting_keys, sbert_mask = preprocess_sbert(s2_cube_np, self.device)
                     pixels, sequence_length, _ = s2_cube_np.shape
-                    print(s2_cube_np.shape)
+                    # s2_cube_np = torch.from_numpy(s2_cube_np).to(self.device)
+                    # sorting_keys = torch.from_numpy(sorting_keys).to(self.device)
 
-                    sbert_mask = ~s2_cube_np.isnan().any(dim=2).reshape((pixels, sequence_length, 1))
+                    # sbert_mask = ~s2_cube_np.isnan().any(dim=2).reshape((pixels, sequence_length, 1))
 
                     sensing_dates_as_ordinal: np.ndarray = np.zeros((sequence_length,), dtype=np.int32)
                     sensing_dates_as_ordinal[index_offset:] = [TensorDataCube.ordinal_observation(i) for i in self.cube_inputs]
