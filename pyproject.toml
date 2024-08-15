@@ -12,13 +12,13 @@ maintainers = [
 ]  
 readme = "README.md"
 repository = "https://github.com/Florian-Katerndahl/sits-dl"
-#packages = [
-#    { include = "sits_dl" }
-#]
+packages = [
+    { include = "sits_dl" }
+]
 
 
 [tool.poetry.scripts]
-inference = "apps.inference:main"
+inference = "sits_dl.inference:main"
 
 
 [tool.poetry.dependencies]
