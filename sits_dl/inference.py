@@ -212,7 +212,6 @@ def main() -> int:
         inference_model.eval()
         inference_model.to(device)
         # compilation could be tweaked more, but this would also result in longer compilation times. Testing would be needed to see if the trade-off is worthwhile
-        # mode="max-autotune",
         opt_model = torch.compile(inference_model, dynamic=False, fullgraph=False)
         # opt_model = torch.compile(inference_model, dynamic=False, fullgraph=True,
         #                           options={"cuda.enable_cuda_lto": True, "epilogue_fusion": True, "triton.cudagraphs": True, "shape_padding": True,

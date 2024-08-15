@@ -14,30 +14,6 @@ import rioxarray as rxr
 from xarray import Dataset, DataArray
 from sits_dl.forestmask import ForestMask
 
-@njit(['float32[:,:,:](float32[:,:,:], Omitted(1e-6))', 'float32[:,:,:](float32[:,:,:], float32)'], parallel=True)
-def znorm_PSB(dc: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """Apply z-normalization to data cube per pixel and per band.
-
-    .. note:: Only valid for a datacube with the shape (pixels, sequence, bands)
-
-    :param dc: Input data cube
-    :type dc: np.ndarray
-    :param eps: Epsilon to add for numeric stability, defaults to 1e-6
-    :type eps: float, optional
-    :return: Datacube normalized for each pixel and band across sequence length.
-    :rtype: np.ndarray
-    """    
-    out: np.ndarray = np.empty_like(dc)
-    for pixel in prange(dc.shape[0]):
-        for band in prange(dc.shape[-1]):
-            out[pixel, :, band] = (dc[pixel, :, band] - np.nanmean(dc[pixel, :, band])) / np.nanstd(dc[pixel, :, band]) + eps
-    return out
-
-
-@torch.compile(dynamic=False, fullgraph=True)
-def nanstd_psb_t(dc: torch.Tensor, dim: int, keepdim: bool = True) -> torch.Tensor:
-    return (dc - torch.nanmean(dc, dim=dim, keepdim=keepdim)).square().nanmean(dim=dim, keepdim=keepdim).sqrt()
-
 
 @torch.compile(dynamic=False, fullgraph=True)
 def znorm_psb_t(dc: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -62,7 +38,6 @@ def preprocess_sbert(dc: np.ndarray, device: torch.device) -> torch.Tensor:
     sbert_mask = ~dc_t.isnan().any(dim=2).reshape((pixels, sequence_length, 1))
 
     del pixels, sequence_length, bands, index_array
-    # print(torch.mean(dc_t, dim=1), torch.std(dc_t, dim=1))
 
     return dc_t, sorting_keys, sbert_mask
 
@@ -278,47 +253,6 @@ class TensorDataCube:
 
         return [TensorDataCube.fp_to_doy(i) for i in observations if isinstance(i, str)], true_observations
 
-
-    @classmethod
-    def pad_datacube(cls, target: int, datacube: np.ndarray, pad_value=np.nan) -> np.ndarray:
-        diff: int = target - datacube.shape[0]
-        if diff < 0:
-            # TODO should also be abs(diff) - 1? is the offset by one even correct?
-            #  Construction of DC above indicates that it's not correct!
-            datacube = np.delete(datacube, list(range(abs(diff))), axis=0)  # deletes oldest entries first
-        elif diff > 0:
-            datacube = np.pad(datacube, ((0, diff), (0, 0), (0, 0), (0, 0)), constant_values=pad_value)  # should be end padding
-
-        # TODO remove assertion for "production"
-        assert target == datacube.shape[0]
-
-        return datacube
-
-
-    @classmethod
-    def pad_long_datacube(cls, target: int, datacube: np.ndarray, pad_value: Union[int, float] = np.nan) -> np.ndarray:
-        """Pad datacube in (x * y, observations, bands)-format in axis of observations.
-
-        .. note:: Oldest items are deleted first, if datacube has more entries than sequence length.
-
-        :param target: Sequence length
-        :type target: int
-        :param datacube: Datacube to pad or crop
-        :type datacube: np.ndarray
-        :param pad_value: Value used for padding, defaults to np.nan
-        :type pad_value: Union[int, float], optional
-        :return: Datacube with second dimension expanded or shortened
-        :rtype: np.ndarray
-        """        
-        diff: int = target - datacube.shape[1]
-        if diff < 0:
-            datacube = np.delete(datacube, list(range(abs(diff) - 1)), axis=1)  # WAIT A SECOND, '- 1' IS WRONG?
-        elif diff > 0:
-            datacube = np.pad(datacube, ((0, 0), (diff, 0), (0, 0)), constant_values=pad_value)  # (diff, 0) is start padding instead of end padding; THIS WAS THE ERROR
-
-        assert target == datacube.shape[1]
-
-        return datacube
 
 
     @classmethod
