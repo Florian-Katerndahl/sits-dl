@@ -170,29 +170,8 @@ class TensorDataCube:
                     sensing_doys_np = sensing_doys_np.transpose((2, 3, 0, 1))
                     sensing_doys_np = sensing_doys_np.reshape((-1, *sensing_doys_np.shape[2:]))
                 elif self.inference_type == Models.SBERT:
-                    # Goal: move all valid observations to the "front" of the data cube (i.e. lower indices)
-                    # TODO rewrite to use torch tensors??
-                    # test_np = s2_cube_np.copy()
-                    # t444 = time()
-                    # s2_cube_np = np.transpose(s2_cube_np, (2, 3, 0, 1))
-                    # s2_cube_np[s2_cube_np == -9999] = np.nan
-                    # s2_cube_np = np.reshape(s2_cube_np, (-1, *s2_cube_np.shape[2:]))
-                    # pixels, sequence_length, bands = s2_cube_np.shape
-                    # observations_without_nodata: np.ndarray = ~np.isnan(s2_cube_np).any(axis=2)
-                    # s2_cube_np[~observations_without_nodata] = np.nan
-                    # index_array = np.arange(sequence_length).reshape((1, sequence_length, 1)).repeat(pixels, axis=0)
-                    # index_array[observations_without_nodata] -= sequence_length * 2
-                    # # sorting_keys is now an array where for each pixel, the indices are sorted such that all non-nan observations are followed by all nan observations.
-                    # # Within the respective groups, ordering is kept by observation date
-                    # sorting_keys = index_array.argsort(axis=1)
-                    # s2_cube_np = np.take_along_axis(s2_cube_np, sorting_keys, axis=1)  # actually move data
-
                     s2_cube_np, sorting_keys, sbert_mask = preprocess_sbert(s2_cube_np, self.device)
                     pixels, sequence_length, _ = s2_cube_np.shape
-                    # s2_cube_np = torch.from_numpy(s2_cube_np).to(self.device)
-                    # sorting_keys = torch.from_numpy(sorting_keys).to(self.device)
-
-                    # sbert_mask = ~s2_cube_np.isnan().any(dim=2).reshape((pixels, sequence_length, 1))
 
                     sensing_dates_as_ordinal: np.ndarray = np.zeros((sequence_length,), dtype=np.int32)
                     sensing_dates_as_ordinal[index_offset:] = [TensorDataCube.ordinal_observation(i) for i in self.cube_inputs]
@@ -215,10 +194,6 @@ class TensorDataCube:
                     del sensing_doys_no, sbert_mask, sensing_doys
                 elif self.inference_type == Models.LSTM:
                     cube_and_doys = s2_cube_np
-                
-                # s2_cube_torch: torch.Tensor = torch.from_numpy(cube_and_doys).float()
-
-                # del s2_cube_np, cube_and_doys
 
                 yield cube_and_doys, mask, row, col, t_chunk
 
