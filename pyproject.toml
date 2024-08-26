@@ -5,16 +5,12 @@ description = ""
 authors = [
     "Florian Katerndahl <florian@katerndahl.com>",
     "Christopher Schiller <christopher.schiller@fu-berlin.de>",
-    "Jonathan Költzow <jonathan.koeltzow@fu-berlin.de>"
+    "Jonathan Költzow <jonathan.koeltzow@fu-berlin.de>",
 ]
-maintainers = [
-    "Florian Katerndahl <florian@katerndahl.com>"
-]  
+maintainers = ["Florian Katerndahl <florian@katerndahl.com>"]
 readme = "README.md"
 repository = "https://github.com/Florian-Katerndahl/sits-dl"
-packages = [
-    { include = "sits_dl" }
-]
+packages = [{ include = "sits_dl" }]
 
 
 [tool.poetry.scripts]
