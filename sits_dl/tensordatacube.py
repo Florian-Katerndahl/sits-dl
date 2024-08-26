@@ -1,17 +1,15 @@
-from datetime import datetime, date
+from datetime import datetime
 from time import time
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Union, Tuple
 from re import search, Pattern, compile
+import multiprocessing as mp
 from warnings import warn
 import torch
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 import rasterio
 import numpy as np
-from numba import njit, prange
-import rioxarray as rxr
-from xarray import Dataset, DataArray
 from sits_dl.forestmask import ForestMask
 
 
@@ -25,12 +23,19 @@ def znorm_psb_t(dc: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 @torch.compile()
 def preprocess_sbert(dc: np.ndarray, device: torch.device) -> torch.Tensor:
-    dc_t: torch.Tensor = torch.from_numpy(dc).to(device=device).permute(2, 3, 0, 1).reshape((-1, *dc.shape[:2]))
+    dc_t: torch.Tensor = (
+        torch.from_numpy(dc).to(device=device).permute(2, 3, 0, 1).reshape((-1, *dc.shape[:2]))
+    )
     dc_t[dc_t == -9999] = torch.nan
     pixels, sequence_length, bands = dc_t.shape
     observations_without_nodata: torch.Tensor = ~dc_t.isnan().any(dim=2).to(device=device)
     dc_t[~observations_without_nodata] = torch.nan
-    index_array: torch.Tensor = torch.arange(sequence_length).reshape((1, sequence_length, 1)).repeat_interleave(pixels, dim=0).to(device=device)
+    index_array: torch.Tensor = (
+        torch.arange(sequence_length)
+        .reshape((1, sequence_length, 1))
+        .repeat_interleave(pixels, dim=0)
+        .to(device=device)
+    )
     index_array[observations_without_nodata] -= sequence_length * 2
     sorting_keys: torch.Tensor = index_array.argsort(dim=1)
     dc_t = dc_t.take_along_dim(sorting_keys, dim=1)
@@ -46,6 +51,7 @@ class Models(Enum):
     """
     Known model types.
     """
+
     LSTM = 0
     TRANSFORMER = 1
     SBERT = 2
@@ -74,6 +80,7 @@ class TensorDataCube:
         row_step: Optional[int] = None,
         column_step: Optional[int] = None,
         sequence_length: Optional[int] = None,
+        chunk_queue: mp.Queue = None,
     ) -> "TensorDataCube":
         self.input_directory: Path = input_directory
         self.tile_id: str = tile_id
@@ -86,31 +93,42 @@ class TensorDataCube:
         self.sequence_length: Optional[int] = sequence_length
         self.forestmask = ForestMask(mask_dir, tile_id, mask_glob)
         self.device = device
+        self.chunk_queue = chunk_queue
 
         self.cube_inputs: Optional[List[str]] = None
         self.image_info: Optional[Dict] = None
         self.output_metadata: Optional[Dict] = None
 
     def self_prep(self) -> None:
-        warn(("Only front padding implemented currently. I.e. If DC is your datacube and n < seq, the first n-seq "
-              "items are filled with NAs and only the last seq-many items are valid observations"))
-        tile_paths: List[str] = [str(p) for p in (self.input_directory / self.tile_id).glob(self.input_glob)]
+        warn(
+            (
+                "Only front padding implemented currently. I.e. If DC is your datacube and n < seq, the first n-seq "
+                "items are filled with NAs and only the last seq-many items are valid observations"
+            )
+        )
+        tile_paths: List[str] = [
+            str(p) for p in (self.input_directory / self.tile_id).glob(self.input_glob)
+        ]
         if self.start:
             self.cube_inputs = [
-                tile_path for tile_path in tile_paths \
-                    if self.start <= int(search(r"\d{8}", tile_path).group(0)) <= self.cutoff
+                tile_path
+                for tile_path in tile_paths
+                if self.start <= int(search(r"\d{8}", tile_path).group(0)) <= self.cutoff
             ]
         else:
             self.cube_inputs = [
-                tile_path for tile_path in tile_paths \
-                    if int(search(r"\d{8}", tile_path).group(0)) <= self.cutoff
+                tile_path
+                for tile_path in tile_paths
+                if int(search(r"\d{8}", tile_path).group(0)) <= self.cutoff
             ]
         self.cube_inputs.sort()
 
         with rasterio.open(self.cube_inputs[0]) as f:
             self.output_metadata = f.meta
             input_bands, self.output_metadata["count"] = self.output_metadata["count"], 1
-            self.output_metadata["dtype"] = rasterio.float32 if self.inference_type == Models.SBERT else rasterio.uint8
+            self.output_metadata["dtype"] = (
+                rasterio.float32 if self.inference_type == Models.SBERT else rasterio.uint8
+            )
             self.output_metadata["nodata"] = TensorDataCube.OUTPUT_NODATA
             row_block, col_block = f.block_shapes[0]
 
@@ -123,46 +141,34 @@ class TensorDataCube:
         self.row_step = self.row_step or row_block
         self.column_step = self.column_step or col_block
 
-        if (self.image_info["tile_width"] % self.column_step) != 0 or (self.image_info["tile_height"] % self.row_step) != 0:
-            raise AssertionError("Rows and columns must be divisible by their respective step sizes without remainder.")
+        if (self.image_info["tile_width"] % self.column_step) != 0 or (
+            self.image_info["tile_height"] % self.row_step
+        ) != 0:
+            raise AssertionError(
+                "Rows and columns must be divisible by their respective step sizes without remainder."
+            )
 
     def __iter__(self):
         for row in range(0, self.image_info["tile_height"], self.row_step):
             for col in range(0, self.image_info["tile_width"], self.column_step):
                 t_chunk = time()
-                mask: Optional[np.ndarray] = self.forestmask.get_mask(row, row + self.row_step, col, col + self.column_step)
-
-                s2_cube_np: np.ndarray = np.full(
-                    (self.sequence_length, self.image_info["input_bands"], self.row_step, self.column_step),
-                    np.nan,
-                    dtype=np.float32
-                )
-
-                index_offset = 0 if (diff := self.sequence_length - len(self.cube_inputs)) < 0 else abs(diff)
-                if index_offset == 0:
-                    self.cube_inputs = self.cube_inputs[-diff:]
-                for _, (index, cube_input) in zip(range(self.sequence_length), enumerate(self.cube_inputs, start=index_offset)):
-                    """
-                    Zipping by sequences ensures that at mose sequence_length many observations are read.
-                    This makes padding further down below unnecessary!
-                    """
-                    ds: Union[Dataset, DataArray] = rxr.open_rasterio(cube_input)
-                    clipped_ds = ds.isel(y=slice(row, row + self.row_step), x=slice(col, col + self.column_step))
-                    s2_cube_np[index] = clipped_ds.to_numpy()
-                    ds.close()
-                    del ds, clipped_ds
+                s2_cube_np, mask, index_offset = self.chunk_queue.get()
 
                 if self.inference_type == Models.TRANSFORMER:
-                    _t: Tuple[List[Union[datetime, float]], List[bool]] = TensorDataCube.pad_doy_sequence(
-                        self.sequence_length,
-                        self.cube_inputs,
-                        self.inference_type
+                    _t: Tuple[
+                        List[Union[datetime, float]], List[bool]
+                    ] = TensorDataCube.pad_doy_sequence(
+                        self.sequence_length, self.cube_inputs, self.inference_type
                     )
                     sensing_doys, sbert_mask = _t
                     sensing_doys_np: np.ndarray = np.array(sensing_doys)
                     sensing_doys_np = sensing_doys_np.reshape((self.sequence_length, 1, 1, 1))
-                    sensing_doys_np = np.repeat(sensing_doys_np, self.row_step, axis=2)     # match actual data cube
-                    sensing_doys_np = np.repeat(sensing_doys_np, self.column_step, axis=3)  # match actual data cube
+                    sensing_doys_np = np.repeat(
+                        sensing_doys_np, self.row_step, axis=2
+                    )  # match actual data cube
+                    sensing_doys_np = np.repeat(
+                        sensing_doys_np, self.column_step, axis=3
+                    )  # match actual data cube
 
                     # lines below needed now for compatability with SBERT datacube
                     s2_cube_np = s2_cube_np.transpose((2, 3, 0, 1))
@@ -173,12 +179,28 @@ class TensorDataCube:
                     s2_cube_np, sorting_keys, sbert_mask = preprocess_sbert(s2_cube_np, self.device)
                     pixels, sequence_length, _ = s2_cube_np.shape
 
-                    sensing_dates_as_ordinal: np.ndarray = np.zeros((sequence_length,), dtype=np.int32)
-                    sensing_dates_as_ordinal[index_offset:] = [TensorDataCube.ordinal_observation(i) for i in self.cube_inputs]
-                    sensing_doys_np = sensing_dates_as_ordinal.reshape((1, sequence_length, 1)).repeat(pixels, axis=0)
-                    sensing_doys_np = np.take_along_axis(sensing_doys_np, sorting_keys.numpy(force=True), axis=1)
-                    doy_of_earliest_observations = TensorDataCube.toyday(sensing_doys_np[:, 0, 0]).reshape((pixels, 1)).repeat(sequence_length, axis=1)
-                    sensing_doys_np = (sensing_doys_np[..., 0] - sensing_doys_np[:, 0].repeat(sequence_length, axis=1) + doy_of_earliest_observations).reshape((pixels, sequence_length, 1))
+                    sensing_dates_as_ordinal: np.ndarray = np.zeros(
+                        (sequence_length,), dtype=np.int32
+                    )
+                    sensing_dates_as_ordinal[index_offset:] = [
+                        TensorDataCube.ordinal_observation(i) for i in self.cube_inputs
+                    ]
+                    sensing_doys_np = sensing_dates_as_ordinal.reshape(
+                        (1, sequence_length, 1)
+                    ).repeat(pixels, axis=0)
+                    sensing_doys_np = np.take_along_axis(
+                        sensing_doys_np, sorting_keys.numpy(force=True), axis=1
+                    )
+                    doy_of_earliest_observations = (
+                        TensorDataCube.toyday(sensing_doys_np[:, 0, 0])
+                        .reshape((pixels, 1))
+                        .repeat(sequence_length, axis=1)
+                    )
+                    sensing_doys_np = (
+                        sensing_doys_np[..., 0]
+                        - sensing_doys_np[:, 0].repeat(sequence_length, axis=1)
+                        + doy_of_earliest_observations
+                    ).reshape((pixels, sequence_length, 1))
                     sensing_doys_np[~sbert_mask.numpy(force=True)] = 0
 
                 if self.inference_type in [Models.TRANSFORMER, Models.SBERT]:
@@ -186,39 +208,59 @@ class TensorDataCube:
                     s2_cube_np[s2_cube_np.isnan()] = 0.0
 
                 if self.inference_type == Models.SBERT:
-                    cube_and_doys = torch.cat([s2_cube_np, torch.from_numpy(sensing_doys_np).to(device=self.device), sbert_mask], dim=2)  # 11 seconds
-                    del sbert_mask, sensing_dates_as_ordinal, sensing_doys_np, \
-                        doy_of_earliest_observations, sorting_keys  # index_array, observations_without_nodata
+                    cube_and_doys = torch.cat(
+                        [
+                            s2_cube_np,
+                            torch.from_numpy(sensing_doys_np).to(device=self.device),
+                            sbert_mask,
+                        ],
+                        dim=2,
+                    )
+                    del (
+                        sbert_mask,
+                        sensing_dates_as_ordinal,
+                        sensing_doys_np,
+                        doy_of_earliest_observations,
+                        sorting_keys,
+                    )
                 elif self.inference_type == Models.TRANSFORMER:
-                    cube_and_doys = torch.cat([s2_cube_np, torch.from_numpy(sensing_doys_np).to(device=self.device)], dim=2)  # 6.7 seonds
+                    cube_and_doys = torch.cat(
+                        [s2_cube_np, torch.from_numpy(sensing_doys_np).to(device=self.device)],
+                        dim=2,
+                    )
                     del sensing_doys_no, sbert_mask, sensing_doys
                 elif self.inference_type == Models.LSTM:
                     cube_and_doys = s2_cube_np
 
                 yield cube_and_doys, mask, row, col, t_chunk
 
-
-    def empty_output(self, dtype: torch.dtype=torch.long) -> torch.Tensor:
+    def empty_output(self, dtype: torch.dtype = torch.long) -> torch.Tensor:
         return torch.full(
             [self.image_info["tile_height"], self.image_info["tile_width"]],
             fill_value=TensorDataCube.OUTPUT_NODATA,
             dtype=dtype,
-            device="cpu"
+            device="cpu",
         )
-    
 
     @classmethod
     def to_dataloader(cls, chunk: torch.Tensor, batch_size: int, workers: int = 4) -> DataLoader:
-        return DataLoader(chunk, batch_size=batch_size, pin_memory=True, num_workers=workers, persistent_workers=False)
-
+        return DataLoader(
+            chunk,
+            batch_size=batch_size,
+            pin_memory=True,
+            num_workers=workers,
+            persistent_workers=False,
+        )
 
     @classmethod
-    def pad_doy_sequence(cls, target: int, observations: List[str], mtype: Models) -> Tuple[List[Union[datetime, float]], List[bool]]:
+    def pad_doy_sequence(
+        cls, target: int, observations: List[str], mtype: Models
+    ) -> Tuple[List[Union[datetime, float]], List[bool]]:
         diff: int = target - len(observations)
         true_observations: List[bool] = [True] * len(observations)
         if diff < 0:
-            observations = observations[abs(diff):]  # deletes oldest entries first
-            true_observations = true_observations[abs(diff):]
+            observations = observations[abs(diff) :]  # deletes oldest entries first
+            true_observations = true_observations[abs(diff) :]
         elif diff > 0:
             observations += [0.0] * diff
             true_observations += [False] * diff
@@ -226,9 +268,9 @@ class TensorDataCube:
         # TODO remove assertion for "production"
         assert target == len(observations)
 
-        return [TensorDataCube.fp_to_doy(i) for i in observations if isinstance(i, str)], true_observations
-
-
+        return [
+            TensorDataCube.fp_to_doy(i) for i in observations if isinstance(i, str)
+        ], true_observations
 
     @classmethod
     def fp_to_doy(cls, file_path: str, origin: Optional[str] = None) -> datetime:
@@ -243,12 +285,10 @@ class TensorDataCube:
             return (d - od).days + od.timetuple().tm_yday
         return d.timetuple.tm_yday
 
-
     @staticmethod
     @np.vectorize(otypes=[int])
     def toyday(x):
         return datetime.fromordinal(x).timetuple().tm_yday
-    
 
     @staticmethod
     def ordinal_observation(x: str) -> int:
