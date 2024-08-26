@@ -15,6 +15,17 @@ from sits_dl.forestmask import ForestMask
 
 @torch.compile(dynamic=False, fullgraph=True)
 def znorm_psb_t(dc: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Z-normalize input data cube in PSB form (pixels, sequence, spectral bands) across sequence
+
+    .. note:: This function is `torch.compile`'ed!
+
+    :param dc: Data cube to normalize
+    :type dc: torch.Tensor
+    :param eps: Epsilon, defaults to 1e-6
+    :type eps: float, optional
+    :return: Z-normalized tensor
+    :rtype: torch.Tensor
+    """    
     _mean: torch.Tensor = torch.nanmean(dc, dim=1, keepdim=True)
     _std = (dc - _mean).square().nanmean(dim=1, keepdim=True).sqrt()
     normed = (dc - _mean) / _std + eps
@@ -22,7 +33,19 @@ def znorm_psb_t(dc: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 @torch.compile()
-def preprocess_sbert(dc: np.ndarray, device: torch.device) -> torch.Tensor:
+def preprocess_sbert(dc: np.ndarray, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Process SBERT data cube. I.e., move all valid observations to the "front" of the data
+      cube and calculate a mask for all valid/invalid observations
+
+    .. note:: This function is `torch.compile`'ed!
+
+    :param dc: Data cube to process with [Sequence, Bands, X, Y]
+    :type dc: np.ndarray
+    :param device: torch device on which data is to be processed
+    :type device: torch.device
+    :return: processed tensor, tensor used to sort processed tensor and mask tensor
+    :rtype: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    """    
     dc_t: torch.Tensor = (
         torch.from_numpy(dc).to(device=device).permute(2, 3, 0, 1).reshape((-1, *dc.shape[:2]))
     )
@@ -100,6 +123,13 @@ class TensorDataCube:
         self.output_metadata: Optional[Dict] = None
 
     def self_prep(self) -> None:
+        """Gather input files, filter them by date and acquire image properties
+
+        This method is to be called before actual processing stars.
+
+        :raises AssertionError: If rows and/or columns of input images are not equally divisible by chosen
+          step size.
+        """        
         warn(
             (
                 "Only front padding implemented currently. I.e. If DC is your datacube and n < seq, the first n-seq "
@@ -149,6 +179,11 @@ class TensorDataCube:
             )
 
     def __iter__(self):
+        """Process chunks of data cube in iterative fashion
+
+        :yield: Tensor with normalized spectral values, DOY and mask, forest mask tensor, etc
+        :rtype: Tuple
+        """        
         for row in range(0, self.image_info["tile_height"], self.row_step):
             for col in range(0, self.image_info["tile_width"], self.column_step):
                 t_chunk = time()
@@ -235,6 +270,13 @@ class TensorDataCube:
                 yield cube_and_doys, mask, row, col, t_chunk
 
     def empty_output(self, dtype: torch.dtype = torch.long) -> torch.Tensor:
+        """Create output tensor into which predictions can be stored, filled with output nodata value
+
+        :param dtype: Data type of returned tensor, defaults to torch.long
+        :type dtype: torch.dtype, optional
+        :return: Filled output tensor
+        :rtype: torch.Tensor
+        """        
         return torch.full(
             [self.image_info["tile_height"], self.image_info["tile_width"]],
             fill_value=TensorDataCube.OUTPUT_NODATA,
@@ -287,9 +329,26 @@ class TensorDataCube:
 
     @staticmethod
     @np.vectorize(otypes=[int])
-    def toyday(x):
+    def toyday(x: np.ndarray) -> np.ndarray:
+        """Calculate day of year of numpy array in vectorized form
+
+        :param x: Numpy array
+        :type x: np.ndarray
+        :return: Numpy array with DOY's
+        :rtype: np.ndarray
+        """        
         return datetime.fromordinal(x).timetuple().tm_yday
 
     @staticmethod
     def ordinal_observation(x: str) -> int:
+        """Compute ordinal date from input file names
+
+        .. warning:: This method assumes, that there is indeed a correctly formatted
+          date sub-string in x.
+
+        :param x: String (file name) containing date string in 'YYYYMMDD' format
+        :type x: str
+        :return: Date in ordinal form
+        :rtype: int
+        """        
         return datetime.strptime(TensorDataCube.DATE_IN_FPATH.findall(x)[0], "%Y%m%d").toordinal()
